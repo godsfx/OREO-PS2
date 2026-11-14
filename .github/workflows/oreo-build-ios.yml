@@ -127,7 +127,7 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/oreo-import-fixes.patch" <<'OREO_PATCH_EOF'
           diff --git a/Cascade/Core/GameLibraryManager.swift b/Cascade/Core/GameLibraryManager.swift
-          index e9661b1..5d11502 100644
+          index e9661b1..178eb70 100644
           --- a/Cascade/Core/GameLibraryManager.swift
           +++ b/Cascade/Core/GameLibraryManager.swift
           @@ -132,7 +132,16 @@ public final class GameLibraryManager: ObservableObject {
@@ -290,7 +290,7 @@ jobs:
           -        for line in cueText.components(separatedBy: "\n") {
           +    // MARK: - Static Import Helpers (run off main actor)
           +
-          +    private static func binName(inCUE cueURL: URL) -> String? {
+          +    private nonisolated static func binName(inCUE cueURL: URL) -> String? {
           +        let text = (try? String(contentsOf: cueURL, encoding: .utf8))
           +            ?? (try? String(contentsOf: cueURL, encoding: .isoLatin1))
           +            ?? ""
@@ -316,7 +316,7 @@ jobs:
           -            if FileManager.default.fileExists(atPath: binSrc.path),
           -               !FileManager.default.fileExists(atPath: binDest.path) {
           -                try FileManager.default.copyItem(at: binSrc, to: binDest)
-          +    private static func makeEntry(for dest: URL, problems: inout [String]) -> GameEntry {
+          +    private nonisolated static func makeEntry(for dest: URL, problems: inout [String]) -> GameEntry {
           +        let ext  = dest.pathExtension.lowercased()
           +        let cdvd = CDVD()
           +        do {
@@ -336,6 +336,15 @@ jobs:
                    if !cdvd.discID.isEmpty {
                        entry.id    = cdvd.discID
                        entry.title = titleLookup[cdvd.discID.uppercased()] ?? entry.title
+          @@ -301,7 +353,7 @@ public final class GameLibraryManager: ObservableObject {
+           
+               // MARK: - Title Lookup
+           
+          -    private static let titleLookup: [String: String] = [
+          +    private nonisolated static let titleLookup: [String: String] = [
+                   "SLUS-20062": "Grand Theft Auto III",
+                   "SLUS-20415": "Grand Theft Auto: San Andreas",
+                   "SLUS-20184": "Grand Theft Auto: Vice City",
           diff --git a/Cascade/UI/LibraryView.swift b/Cascade/UI/LibraryView.swift
           index 1f8c16f..af649ae 100644
           --- a/Cascade/UI/LibraryView.swift
