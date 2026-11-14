@@ -127,7 +127,7 @@ jobs:
         run: |
           cat > "$RUNNER_TEMP/oreo-import-fixes.patch" <<'OREO_PATCH_EOF'
           diff --git a/Cascade/Core/GameLibraryManager.swift b/Cascade/Core/GameLibraryManager.swift
-          index e9661b1..178eb70 100644
+          index e9661b1..cba9157 100644
           --- a/Cascade/Core/GameLibraryManager.swift
           +++ b/Cascade/Core/GameLibraryManager.swift
           @@ -132,7 +132,16 @@ public final class GameLibraryManager: ObservableObject {
@@ -148,7 +148,7 @@ jobs:
                    }
                    if let data = try? Data(contentsOf: collectionsURL),
                       let decoded = try? JSONDecoder().decode([GameCollection].self, from: data) {
-          @@ -153,87 +162,130 @@ public final class GameLibraryManager: ObservableObject {
+          @@ -153,87 +162,169 @@ public final class GameLibraryManager: ObservableObject {
                // MARK: - Import Games (async — file copy runs on a background thread)
            
                func importGame(from url: URL) {
@@ -200,13 +200,26 @@ jobs:
           +            for url in picked {
           +                let dest = destDir.appendingPathComponent(url.lastPathComponent)
           +                do {
-          +                    if !FileManager.default.fileExists(atPath: dest.path) {
-          +                        try FileManager.default.copyItem(at: url, to: dest)
+          +                    let sourceSize = GameLibraryManager.fileSize(atPath: url.path)
+          +                    // A leftover from an earlier failed import must not be reused.
+          +                    if FileManager.default.fileExists(atPath: dest.path),
+          +                       GameLibraryManager.fileSize(atPath: dest.path) != sourceSize {
+          +                        try FileManager.default.removeItem(at: dest)
                                }
           -                    self.isImporting = false
+          +                    if !FileManager.default.fileExists(atPath: dest.path) {
+          +                        try FileManager.default.copyItem(at: url, to: dest)
+          +                        let copiedSize = GameLibraryManager.fileSize(atPath: dest.path)
+          +                        if sourceSize >= 0 && copiedSize != sourceSize {
+          +                            try? FileManager.default.removeItem(at: dest)
+          +                            throw NSError(domain: "OREO", code: 1, userInfo: [
+          +                                NSLocalizedDescriptionKey:
+          +                                    "the copy is incomplete (\(copiedSize) of \(sourceSize) bytes). Is the device out of storage?"])
+          +                        }
+          +                    }
           +                    copied.append(dest)
           +                } catch {
-          +                    problems.append("\(url.lastPathComponent): could not be copied (\(error.localizedDescription))")
+          +                    problems.append("\(url.lastPathComponent): could not be copied (\(GameLibraryManager.describe(error, file: dest)))")
                            }
           -            } catch {
           -                let msg = error.localizedDescription
@@ -309,34 +322,58 @@ jobs:
           -        if !FileManager.default.fileExists(atPath: cueDest.path) {
           -            try FileManager.default.copyItem(at: cueURL, to: cueDest)
           -        }
-          -
+          +    private nonisolated static func fileSize(atPath path: String) -> Int {
+          +        guard let attrs = try? FileManager.default.attributesOfItem(atPath: path),
+          +              let number = attrs[.size] as? NSNumber else { return -1 }
+          +        return number.intValue
+          +    }
+           
           -        if let binName {
           -            let binSrc  = cueURL.deletingLastPathComponent().appendingPathComponent(binName)
           -            let binDest = gamesDir.appendingPathComponent(binName)
           -            if FileManager.default.fileExists(atPath: binSrc.path),
           -               !FileManager.default.fileExists(atPath: binDest.path) {
           -                try FileManager.default.copyItem(at: binSrc, to: binDest)
+          -            }
+          +    /// Plain-language error text with the details needed to find the real cause.
+          +    private nonisolated static func describe(_ error: Error, file: URL) -> String {
+          +        let ns = error as NSError
+          +        var text = "\(ns.localizedDescription) [\(ns.domain) \(ns.code)"
+          +        if let underlying = ns.userInfo[NSUnderlyingErrorKey] as? NSError {
+          +            text += ", underlying \(underlying.domain) \(underlying.code): \(underlying.localizedDescription)"
+                   }
+          +        text += "]"
+          +        let size = fileSize(atPath: file.path)
+          +        if size >= 0 {
+          +            text += " file on device: \(ByteCountFormatter.string(fromByteCount: Int64(size), countStyle: .file))"
+          +        }
+          +        if let free = try? URL(fileURLWithPath: NSHomeDirectory())
+          +            .resourceValues(forKeys: [.volumeAvailableCapacityForImportantUsageKey])
+          +            .volumeAvailableCapacityForImportantUsage {
+          +            text += ", free space: \(ByteCountFormatter.string(fromByteCount: free, countStyle: .file))"
+          +        }
+          +        return text
+          +    }
+           
           +    private nonisolated static func makeEntry(for dest: URL, problems: inout [String]) -> GameEntry {
           +        let ext  = dest.pathExtension.lowercased()
-          +        let cdvd = CDVD()
+                   let cdvd = CDVD()
+          -        try? cdvd.loadCUE(url: cueDest)
+          -        var entry = GameEntry(url: cueDest, cdvd: cdvd)
           +        do {
           +            switch ext {
           +            case "cue": try cdvd.loadCUE(url: dest)
           +            case "chd": try cdvd.loadCHD(url: dest)
           +            default:    try cdvd.loadISO(url: dest)
-                       }
+          +            }
           +        } catch {
-          +            problems.append("\(dest.lastPathComponent): copied, but the disc could not be read (\(error.localizedDescription))")
-                   }
-          -
-          -        let cdvd = CDVD()
-          -        try? cdvd.loadCUE(url: cueDest)
-          -        var entry = GameEntry(url: cueDest, cdvd: cdvd)
+          +            problems.append("\(dest.lastPathComponent): copied, but the disc could not be read (\(describe(error, file: dest)))")
+          +        }
           +        var entry = GameEntry(url: dest, cdvd: cdvd)
                    if !cdvd.discID.isEmpty {
                        entry.id    = cdvd.discID
                        entry.title = titleLookup[cdvd.discID.uppercased()] ?? entry.title
-          @@ -301,7 +353,7 @@ public final class GameLibraryManager: ObservableObject {
+          @@ -301,7 +392,7 @@ public final class GameLibraryManager: ObservableObject {
            
                // MARK: - Title Lookup
            
