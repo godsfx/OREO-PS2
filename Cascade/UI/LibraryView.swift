@@ -1,64 +1,76 @@
 import SwiftUI
-import UniformTypeIdentifiers
 import UIKit
+import UniformTypeIdentifiers
 
-// MARK: - Direct UIKit Document Picker Presenter (Bypasses SwiftUI .sheet Modal Conflicts)
+// MARK: - UIKit Document Picker Presenter (Bypasses iOS 16 SwiftUI .fileImporter Bugs)
 
 @MainActor
-private final class DocumentPickerPresenter: NSObject, ObservableObject, UIDocumentPickerDelegate {
-    private var onPick: (([URL]) -> Void)?
-    private var onCancel: (() -> Void)?
+final class DocumentPickerPresenter: NSObject, ObservableObject, UIDocumentPickerDelegate {
+    enum PickerMode {
+        case game
+        case bios
+    }
 
-    func present(
-        contentTypes: [UTType],
-        allowsMultipleSelection: Bool,
-        onPick: @escaping ([URL]) -> Void,
-        onCancel: @escaping () -> Void
-    ) {
-        guard let topVC = Self.topViewController() else {
-            onCancel()
+    private var onPick: (([URL]) -> Void)?
+    private var isPresenting = false
+
+    func present(mode: PickerMode, onPick: @escaping ([URL]) -> Void) {
+        guard !isPresenting else { return }
+        self.onPick = onPick
+
+        let contentTypes: [UTType]
+        let allowsMultiple: Bool
+
+        switch mode {
+        case .game:
+            let customExtensions = ["iso", "bin", "cue", "chd", "cso", "gz"]
+            let customTypes = customExtensions.compactMap { UTType(filenameExtension: $0) }
+            contentTypes = customTypes.isEmpty ? [.data, .item] : customTypes + [.data]
+            allowsMultiple = true
+        case .bios:
+            let biosExtensions = ["bin", "rom", "nvm", "mec"]
+            let customTypes = biosExtensions.compactMap { UTType(filenameExtension: $0) }
+            contentTypes = customTypes.isEmpty ? [.data, .item] : customTypes + [.data]
+            allowsMultiple = true
+        }
+
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: false)
+        picker.delegate = self
+        picker.allowsMultipleSelection = allowsMultiple
+        picker.shouldShowFileExtensions = true
+
+        guard let topController = Self.topViewController() else {
+            self.onPick = nil
             return
         }
 
-        self.onPick = onPick
-        self.onCancel = onCancel
-
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: false)
-        picker.allowsMultipleSelection = allowsMultipleSelection
-        picker.shouldShowFileExtensions = true
-        picker.delegate = self
-
-        topVC.present(picker, animated: true)
+        isPresenting = true
+        DispatchQueue.main.async {
+            topController.present(picker, animated: true)
+        }
     }
 
     func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-        let pickHandler = onPick
+        isPresenting = false
+        let callback = onPick
         onPick = nil
-        onCancel = nil
-
-        controller.dismiss(animated: true) {
-            pickHandler?(urls)
-        }
+        callback?(urls)
     }
 
     func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-        let cancelHandler = onCancel
+        isPresenting = false
         onPick = nil
-        onCancel = nil
-
-        controller.dismiss(animated: true) {
-            cancelHandler?()
-        }
     }
 
     private static func topViewController() -> UIViewController? {
-        let scenes = UIApplication.shared.connectedScenes
-            .compactMap { $0 as? UIWindowScene }
-        let keyWindow = scenes
-            .flatMap { $0.windows }
-            .first(where: { $0.isKeyWindow }) ?? scenes.first?.windows.first
+        guard let scene = UIApplication.shared.connectedScenes
+            .compactMap({ $0 as? UIWindowScene })
+            .first(where: { $0.activationState == .foregroundActive }),
+              let root = scene.windows.first(where: { $0.isKeyWindow })?.rootViewController else {
+            return nil
+        }
 
-        var current = keyWindow?.rootViewController
+        var current: UIViewController? = root
         while let presented = current?.presentedViewController {
             current = presented
         }
@@ -66,769 +78,733 @@ private final class DocumentPickerPresenter: NSObject, ObservableObject, UIDocum
     }
 }
 
-// MARK: - Library View
+// MARK: - LibraryView
 
 struct LibraryView: View {
-    @EnvironmentObject var library: GameLibraryManager
     @EnvironmentObject var emulatorState: EmulatorState
+    @EnvironmentObject var libraryManager: GameLibraryManager
+    @Environment(\.scenePhase) private var scenePhase
 
-    @StateObject private var pickerPresenter = DocumentPickerPresenter()
+    @StateObject private var documentPicker = DocumentPickerPresenter()
 
-    @State private var isImportingBIOS   = false
-    @State private var biosStatusTitle   = "BIOS Import"
-    @State private var biosStatusAlert: String?
-    @State private var showNoBIOSAlert   = false
-    @State private var showNewCollection = false
-    @State private var newCollectionName = ""
-    @State private var selectedGame: GameEntry?
+    @State private var searchText: String = ""
+    @State private var selectedFilter: LibraryFilter = .all
+    @State private var selectedCollectionID: UUID?
+    @State private var showBIOSRequiredAlert: Bool = false
+    @State private var showNewCollectionSheet: Bool = false
+    @State private var newCollectionName: String = ""
+    @State private var newCollectionColorIndex: Int = 0
+    @State private var gameToRename: GameEntry?
+    @State private var renameText: String = ""
 
-    private let columns = [
-        GridItem(.adaptive(minimum: 155, maximum: 195), spacing: 14)
-    ]
+    enum LibraryFilter: String, CaseIterable, Identifiable {
+        case all = "All Games"
+        case favorites = "Favorites"
+        case recent = "Recent"
 
-    private var lastPlayedGame: GameEntry? {
-        if let g = emulatorState.lastPlayedGame { return g }
-        let id = UserDefaults.standard.string(forKey: "lastPlayedGameID") ?? ""
-        return library.games.first { $0.id == id }
+        var id: String { rawValue }
     }
+
+    private var filteredGames: [GameEntry] {
+        var result = libraryManager.games
+
+        if let collectionID = selectedCollectionID {
+            result = result.filter { $0.collectionID == collectionID }
+        }
+
+        switch selectedFilter {
+        case .all:
+            break
+        case .favorites:
+            result = result.filter { $0.isFavorite }
+        case .recent:
+            result = result
+                .filter { $0.lastPlayedDate != nil }
+                .sorted { ($0.lastPlayedDate ?? .distantPast) > ($1.lastPlayedDate ?? .distantPast) }
+        }
+
+        let query = searchText.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !query.isEmpty {
+            result = result.filter {
+                $0.title.localizedCaseInsensitiveContains(query)
+                || $0.discID.localizedCaseInsensitiveContains(query)
+                || $0.region.localizedCaseInsensitiveContains(query)
+            }
+        }
+
+        return result
+    }
+
+    private let gridColumns = [
+        GridItem(.adaptive(minimum: 158, maximum: 210), spacing: 14)
+    ]
 
     var body: some View {
         NavigationStack {
             ZStack {
-                backgroundGradient
+                LinearGradient(
+                    colors: [
+                        Color(red: 0.05, green: 0.07, blue: 0.12),
+                        Color(red: 0.08, green: 0.11, blue: 0.18)
+                    ],
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+                .ignoresSafeArea()
 
-                if library.games.isEmpty {
-                    emptyState
-                } else {
-                    gameGrid
-                }
-            }
-            .navigationTitle("Cascade")
-            .navigationBarTitleDisplayMode(.large)
-            .searchable(text: $library.searchText, prompt: "Search games…")
-            .toolbar {
-                ToolbarItem(placement: .topBarLeading) {
-                    if !emulatorState.biosLoaded { biosWarningButton }
-                }
-                ToolbarItemGroup(placement: .topBarTrailing) {
-                    filterButton
-                    sortMenu
-                    addButton
-                }
-            }
-            .overlay(alignment: .bottom) {
-                if library.isImporting || isImportingBIOS {
-                    importingBanner(text: isImportingBIOS ? "Importing BIOS…" : "Importing game…")
-                        .padding(.bottom, 24)
-                        .transition(.move(edge: .bottom).combined(with: .opacity))
-                }
-            }
-            .animation(.spring(response: 0.35), value: library.isImporting || isImportingBIOS)
-            .alert("Import Failed", isPresented: Binding(
-                get: { library.importError != nil },
-                set: { if !$0 { library.importError = nil } }
-            )) {
-                Button("OK") { library.importError = nil }
-            } message: {
-                Text(library.importError ?? "")
-            }
-            .alert(biosStatusTitle, isPresented: Binding(
-                get: { biosStatusAlert != nil },
-                set: { if !$0 { biosStatusAlert = nil } }
-            )) {
-                Button("OK") { biosStatusAlert = nil }
-            } message: {
-                Text(biosStatusAlert ?? "")
-            }
-            .alert("No BIOS Detected", isPresented: $showNoBIOSAlert) {
-                Button("Import BIOS") {
-                    UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    openBIOSPicker(afterAlertDismissal: true)
-                }
-                Button("Add Game Anyway", role: .none) {
-                    openGamePicker(afterAlertDismissal: true)
-                }
-                Button("Cancel", role: .cancel) {}
-            } message: {
-                Text("A PS2 BIOS file is required to play games. You can still add games to your library now, but you won't be able to launch them until a BIOS is imported.\n\nRecommended: SCPH-70012.bin")
-            }
-            .sheet(item: $selectedGame) { game in
-                GameDetailView(game: game)
-            }
-            .alert("New Collection", isPresented: $showNewCollection) {
-                TextField("Collection name", text: $newCollectionName)
-                Button("Create") {
-                    if !newCollectionName.isEmpty {
-                        library.addCollection(name: newCollectionName)
-                        newCollectionName = ""
-                    }
-                }
-                Button("Cancel", role: .cancel) { newCollectionName = "" }
-            }
-        }
-    }
+                ScrollView {
+                    VStack(alignment: .leading, spacing: 16) {
+                        statusHeaderCard
 
-    // MARK: - Present Pickers Directly via UIKit
+                        if let lastPlayed = emulatorState.lastPlayedGame {
+                            continuePlayingBanner(for: lastPlayed)
+                        }
 
-    private func openGamePicker(afterAlertDismissal: Bool = false) {
-        let launch = {
-            pickerPresenter.present(
-                contentTypes: [.item, .data],
-                allowsMultipleSelection: true
-            ) { urls in
-                guard !urls.isEmpty else { return }
-                for url in urls {
-                    library.importGame(from: url)
-                }
-            } onCancel: {}
-        }
+                        filterAndCollectionsBar
 
-        if afterAlertDismissal {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: launch)
-        } else {
-            launch()
-        }
-    }
-
-    private func openBIOSPicker(afterAlertDismissal: Bool = false) {
-        let launch = {
-            pickerPresenter.present(
-                contentTypes: [.item, .data],
-                allowsMultipleSelection: true
-            ) { urls in
-                guard !urls.isEmpty else { return }
-                handleBIOSSelection(urls)
-            } onCancel: {}
-        }
-
-        if afterAlertDismissal {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: launch)
-        } else {
-            launch()
-        }
-    }
-
-    // MARK: - BIOS Import Handler
-
-    private func handleBIOSSelection(_ urls: [URL]) {
-        guard !urls.isEmpty else { return }
-        isImportingBIOS = true
-
-        let scopedURLs: [(url: URL, accessed: Bool)] = urls.map { url in
-            (url, url.startAccessingSecurityScopedResource())
-        }
-
-        Task.detached(priority: .userInitiated) {
-            defer {
-                for item in scopedURLs where item.accessed {
-                    item.url.stopAccessingSecurityScopedResource()
-                }
-            }
-
-            do {
-                let fm = FileManager.default
-                let supportDir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
-                let biosDir = supportDir.appendingPathComponent("bios", isDirectory: true)
-                try fm.createDirectory(at: biosDir, withIntermediateDirectories: true)
-
-                var copiedFiles: [(url: URL, size: Int64)] = []
-
-                for item in scopedURLs {
-                    let srcURL = item.url
-                    let destURL = biosDir.appendingPathComponent(srcURL.lastPathComponent)
-                    try Self.coordinatedCopy(from: srcURL, to: destURL)
-                    let attrs = try? fm.attributesOfItem(atPath: destURL.path)
-                    let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
-                    copiedFiles.append((destURL, size))
-                }
-
-                // Prefer the 4 MB .bin BIOS image if multiple BIOS files (.bin, .nvm, .mec, .rom1) were selected
-                let mainBIOS = copiedFiles.first(where: {
-                    $0.url.pathExtension.lowercased() == "bin" && $0.size >= 1_000_000
-                }) ?? copiedFiles.first(where: {
-                    $0.url.pathExtension.lowercased() == "bin"
-                }) ?? copiedFiles.max(by: { $0.size < $1.size }) ?? copiedFiles[0]
-
-                await MainActor.run {
-                    emulatorState.importBIOS(from: mainBIOS.url)
-                    isImportingBIOS = false
-
-                    if emulatorState.biosLoaded {
-                        biosStatusTitle = "BIOS Loaded"
-                        biosStatusAlert = "Berhasil memuat BIOS: \(mainBIOS.url.lastPathComponent)"
-                    } else {
-                        let sizeKB = mainBIOS.size / 1024
-                        biosStatusTitle = "BIOS Ditolak"
-                        biosStatusAlert = "File \(mainBIOS.url.lastPathComponent) (\(sizeKB) KB) berhasil disalin ke sandbox, tetapi ditolak oleh EmulatorState. Pastikan memilih file BIOS PS2 utama berukuran 4096 KB (4 MB)."
-                    }
-                }
-            } catch {
-                let msg = error.localizedDescription
-                await MainActor.run {
-                    isImportingBIOS = false
-                    biosStatusTitle = "BIOS Import Gagal"
-                    biosStatusAlert = "Gagal membaca/menyalin file BIOS: \(msg)"
-                }
-            }
-        }
-    }
-
-    private nonisolated static func coordinatedCopy(from srcURL: URL, to destURL: URL) throws {
-        let fm = FileManager.default
-        if fm.fileExists(atPath: destURL.path) {
-            try fm.removeItem(at: destURL)
-        }
-
-        var coordinatorError: NSError?
-        var copyError: Error?
-
-        let coordinator = NSFileCoordinator()
-        coordinator.coordinate(readingItemAt: srcURL, options: .withoutChanges, error: &coordinatorError) { coordinatedURL in
-            do {
-                try fm.copyItem(at: coordinatedURL, to: destURL)
-            } catch {
-                copyError = error
-            }
-        }
-
-        if let coordinatorError { throw coordinatorError }
-        if let copyError { throw copyError }
-    }
-
-    // MARK: - Add Game Action (BIOS-gated)
-
-    private func requestGameImport() {
-        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-        if emulatorState.biosLoaded {
-            openGamePicker()
-        } else {
-            showNoBIOSAlert = true
-        }
-    }
-
-    // MARK: - Background
-
-    private var backgroundGradient: some View {
-        LinearGradient(
-            colors: [Color(.systemBackground), Color.cascadeBlue.opacity(0.05)],
-            startPoint: .top, endPoint: .bottom
-        )
-        .ignoresSafeArea()
-    }
-
-    // MARK: - Game Grid
-
-    private var gameGrid: some View {
-        ScrollView {
-            VStack(spacing: 0) {
-                if let last = lastPlayedGame, emulatorState.status == .idle {
-                    resumeBanner(game: last)
-                        .padding(.horizontal, 16)
-                        .padding(.top, 8)
-                }
-
-                statusBadge
-                    .padding(.horizontal, 16)
-                    .padding(.top, 8)
-
-                if library.activeFilterCount > 0 {
-                    activeFilterBanner
-                        .padding(.horizontal, 16)
-                        .padding(.top, 8)
-                }
-
-                if !library.collections.isEmpty {
-                    collectionsBar.padding(.top, 10)
-                }
-
-                if library.filteredGames.isEmpty {
-                    noResultsState
-                        .padding(.top, 60)
-                } else {
-                    LazyVGrid(columns: columns, spacing: 14) {
-                        ForEach(library.filteredGames) { game in
-                            GameCardView(game: game)
-                                .onTapGesture {
-                                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                                    selectedGame = game
+                        if filteredGames.isEmpty {
+                            emptyStateView
+                        } else {
+                            LazyVGrid(columns: gridColumns, spacing: 14) {
+                                ForEach(filteredGames) { game in
+                                    GameCardView(
+                                        game: game,
+                                        collection: libraryManager.collections.first(where: { $0.id == game.collectionID }),
+                                        onLaunch: { handleLaunch(game) },
+                                        onToggleFavorite: {
+                                            triggerHaptic(.light)
+                                            libraryManager.toggleFavorite(game)
+                                        },
+                                        onRename: {
+                                            gameToRename = game
+                                            renameText = game.title
+                                        },
+                                        onAssignCollection: { collection in
+                                            libraryManager.assignGame(game, to: collection)
+                                        },
+                                        onDelete: {
+                                            triggerHaptic(.medium)
+                                            libraryManager.deleteGame(game)
+                                        },
+                                        collections: libraryManager.collections
+                                    )
                                 }
-                                .contextMenu { gameContextMenu(game: game) }
+                            }
                         }
                     }
                     .padding(.horizontal, 16)
-                    .padding(.vertical, 12)
+                    .padding(.top, 8)
+                    .padding(.bottom, 28)
                 }
+                .refreshable {
+                    syncFoldersAndBIOS(forceReloadBIOS: !emulatorState.biosLoaded)
+                }
+
+                if libraryManager.isImporting {
+                    importingOverlay
+                }
+            }
+            .navigationTitle("OREO-PS2")
+            .navigationBarTitleDisplayMode(.large)
+            .searchable(text: $searchText, prompt: "Search title, SLUS/SLES ID, region...")
+            .onAppear {
+                syncFoldersAndBIOS(forceReloadBIOS: !emulatorState.biosLoaded)
+            }
+            .onChange(of: scenePhase) { newPhase in
+                if newPhase == .active {
+                    syncFoldersAndBIOS(forceReloadBIOS: !emulatorState.biosLoaded)
+                }
+            }
+            .toolbar {
+                ToolbarItem(placement: .topBarTrailing) {
+                    Menu {
+                        Button {
+                            triggerGameImport()
+                        } label: {
+                            Label("Import Game (ISO / BIN+CUE / CHD)", systemImage: "opticaldisc")
+                        }
+
+                        Button {
+                            triggerBIOSImport()
+                        } label: {
+                            Label("Import PS2 BIOS", systemImage: "cpu")
+                        }
+
+                        Button {
+                            triggerHaptic(.light)
+                            syncFoldersAndBIOS(forceReloadBIOS: true)
+                        } label: {
+                            Label("Rescan Folders (bios & games)", systemImage: "arrow.clockwise")
+                        }
+
+                        Divider()
+
+                        Button {
+                            newCollectionName = ""
+                            newCollectionColorIndex = libraryManager.collections.count % GameCollection.palette.count
+                            showNewCollectionSheet = true
+                        } label: {
+                            Label("New Collection", systemImage: "folder.badge.plus")
+                        }
+                    } label: {
+                        Image(systemName: "plus.circle.fill")
+                            .font(.title3)
+                            .foregroundStyle(Color(red: 0.30, green: 0.62, blue: 1.0))
+                    }
+                }
+            }
+            .alert("PS2 BIOS Required", isPresented: $showBIOSRequiredAlert) {
+                Button("Import BIOS Now") {
+                    triggerBIOSImport()
+                }
+                Button("Rescan Folder") {
+                    syncFoldersAndBIOS(forceReloadBIOS: true)
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("Taruh file BIOS PS2 (scph10000.bin / scph39001.bin / scph70012.bin) ke folder 'On My iPhone → OREO-PS2 → bios' atau tap Import BIOS Now.")
+            }
+            .alert(
+                "Import Error",
+                isPresented: Binding(
+                    get: { libraryManager.lastImportError != nil },
+                    set: { if !$0 { libraryManager.lastImportError = nil } }
+                )
+            ) {
+                Button("OK", role: .cancel) {}
+            } message: {
+                Text(libraryManager.lastImportError ?? "")
+            }
+            .alert("Rename Game", isPresented: Binding(
+                get: { gameToRename != nil },
+                set: { if !$0 { gameToRename = nil } }
+            )) {
+                TextField("Game Title", text: $renameText)
+                Button("Save") {
+                    if let target = gameToRename {
+                        libraryManager.renameGame(target, newTitle: renameText)
+                    }
+                    gameToRename = nil
+                }
+                Button("Cancel", role: .cancel) {
+                    gameToRename = nil
+                }
+            }
+            .sheet(isPresented: $showNewCollectionSheet) {
+                newCollectionSheet
             }
         }
     }
 
-    // MARK: - Resume Banner
+    // MARK: - Subviews
 
-    private func resumeBanner(game: GameEntry) -> some View {
-        Button(action: {
-            UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-            emulatorState.launch(game: game)
-            library.updateLastPlayed(game)
-        }) {
-            HStack(spacing: 12) {
-                Image(systemName: "play.circle.fill")
-                    .font(.title2)
-                    .foregroundStyle(Color.cascadeBlue)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("Continue Playing")
-                        .font(.caption.bold())
-                        .foregroundStyle(.secondary)
-                    Text(game.title)
-                        .font(.subheadline.bold())
-                        .lineLimit(1)
-                }
+    private var statusHeaderCard: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack(spacing: 10) {
+                Circle()
+                    .fill(emulatorState.biosLoaded ? Color.green : Color.orange)
+                    .frame(width: 10, height: 10)
+
+                Text(emulatorState.biosLoaded ? "BIOS Ready" : "BIOS Missing")
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+
                 Spacer()
-                Image(systemName: "chevron.right")
-                    .font(.caption.bold())
-                    .foregroundStyle(.secondary)
+
+                Text("\(emulatorState.executionMode) • \(emulatorState.jitBlockCount) blocks")
+                    .font(.caption.monospaced())
+                    .foregroundStyle(Color.white.opacity(0.75))
+                    .padding(.horizontal, 8)
+                    .padding(.vertical, 4)
+                    .background(Color.white.opacity(0.08), in: Capsule())
             }
-            .padding(.horizontal, 14)
-            .padding(.vertical, 12)
-            .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 14))
-            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.cascadeBlue.opacity(0.25), lineWidth: 1))
+
+            HStack {
+                Text(emulatorState.status)
+                    .font(.caption)
+                    .foregroundStyle(Color.white.opacity(0.68))
+                    .lineLimit(1)
+
+                Spacer()
+
+                if !emulatorState.biosLoaded {
+                    Button {
+                        triggerBIOSImport()
+                    } label: {
+                        Label("Load BIOS", systemImage: "cpu")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Color.orange.opacity(0.24), in: Capsule())
+                            .foregroundStyle(Color.orange)
+                    }
+                } else {
+                    Button {
+                        triggerHaptic(.light)
+                        syncFoldersAndBIOS(forceReloadBIOS: false)
+                    } label: {
+                        Label("Scan", systemImage: "arrow.clockwise")
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 5)
+                            .background(Color.white.opacity(0.10), in: Capsule())
+                            .foregroundStyle(Color.white.opacity(0.85))
+                    }
+                }
+            }
+        }
+        .padding(14)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                )
+        )
+    }
+
+    private func continuePlayingBanner(for game: GameEntry) -> some View {
+        Button {
+            handleLaunch(game)
+        } label: {
+            HStack(spacing: 12) {
+                ZStack {
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .fill(Color(red: 0.22, green: 0.52, blue: 0.96).opacity(0.25))
+                        .frame(width: 46, height: 46)
+                    Image(systemName: "play.fill")
+                        .font(.headline)
+                        .foregroundStyle(Color(red: 0.36, green: 0.68, blue: 1.0))
+                }
+
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("CONTINUE PLAYING")
+                        .font(.caption2.weight(.bold))
+                        .foregroundStyle(Color(red: 0.36, green: 0.68, blue: 1.0))
+                    Text(game.title)
+                        .font(.subheadline.weight(.semibold))
+                        .foregroundStyle(.white)
+                        .lineLimit(1)
+                    Text("\(game.discID) • \(game.regionBadge)")
+                        .font(.caption2.monospaced())
+                        .foregroundStyle(Color.white.opacity(0.65))
+                }
+
+                Spacer()
+
+                Image(systemName: "chevron.right")
+                    .font(.caption.weight(.semibold))
+                    .foregroundStyle(Color.white.opacity(0.5))
+            }
+            .padding(12)
+            .background(
+                RoundedRectangle(cornerRadius: 16, style: .continuous)
+                    .fill(Color(red: 0.14, green: 0.22, blue: 0.38).opacity(0.55))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 16, style: .continuous)
+                            .stroke(Color(red: 0.30, green: 0.62, blue: 1.0).opacity(0.35), lineWidth: 1)
+                    )
+            )
         }
         .buttonStyle(.plain)
     }
 
-    // MARK: - Status Badge
-
-    private var statusBadge: some View {
-        HStack(spacing: 8) {
-            Image(systemName: emulatorState.executionMode == .jit ? "bolt.fill" : "cpu")
-                .font(.caption2.bold())
-                .foregroundStyle(emulatorState.executionMode == .jit ? Color.cascadeBlue : Color.orange)
-            Text(emulatorState.executionMode == .jit ? "JIT Active" : "JitLess Mode")
-                .font(.caption.bold())
-                .foregroundStyle(emulatorState.executionMode == .jit ? Color.cascadeBlue : Color.orange)
-            Spacer()
-            if emulatorState.executionMode == .jit {
-                Text("\(emulatorState.jitBlockCount) blocks cached")
-                    .font(.caption2)
-                    .foregroundStyle(.secondary)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(
-            (emulatorState.executionMode == .jit ? Color.cascadeBlue : Color.orange).opacity(0.08),
-            in: Capsule()
-        )
-        .overlay(
-            Capsule().stroke(
-                (emulatorState.executionMode == .jit ? Color.cascadeBlue : Color.orange).opacity(0.2),
-                lineWidth: 1
-            )
-        )
-    }
-
-    // MARK: - Active Filter Banner
-
-    private var activeFilterBanner: some View {
-        HStack(spacing: 8) {
-            Image(systemName: "line.3.horizontal.decrease.circle.fill")
-                .foregroundStyle(Color.cascadeBlue)
-                .font(.caption.bold())
-
-            if let fmt = library.formatFilter {
-                filterTag(fmt.uppercased(), color: .cascadeBlue)
-            }
-            if let region = library.regionFilter {
-                filterTag(region, color: .purple)
-            }
-
-            Text("· \(library.filteredGames.count) game\(library.filteredGames.count == 1 ? "" : "s")")
-                .font(.caption)
-                .foregroundStyle(.secondary)
-
-            Spacer()
-
-            Button(action: {
-                UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                library.clearFilters()
-            }) {
-                Text("Clear")
-                    .font(.caption.bold())
-                    .foregroundStyle(Color.cascadeBlue)
-            }
-        }
-        .padding(.horizontal, 12)
-        .padding(.vertical, 7)
-        .background(Color.cascadeBlue.opacity(0.07), in: RoundedRectangle(cornerRadius: 10))
-        .overlay(RoundedRectangle(cornerRadius: 10).stroke(Color.cascadeBlue.opacity(0.15), lineWidth: 1))
-    }
-
-    private func filterTag(_ text: String, color: Color) -> some View {
-        Text(text)
-            .font(.caption2.bold())
-            .foregroundStyle(color)
-            .padding(.horizontal, 7)
-            .padding(.vertical, 3)
-            .background(color.opacity(0.12), in: Capsule())
-    }
-
-    // MARK: - Collections Bar
-
-    private var collectionsBar: some View {
+    private var filterAndCollectionsBar: some View {
         ScrollView(.horizontal, showsIndicators: false) {
             HStack(spacing: 8) {
-                collectionChip(label: "All", id: nil, color: .cascadeBlue)
-                ForEach(library.collections) { col in
-                    collectionChip(label: col.name, id: col.id, color: col.color)
+                ForEach(LibraryFilter.allCases) { filter in
+                    let isSelected = (selectedCollectionID == nil && selectedFilter == filter)
+                    Button {
+                        triggerHaptic(.light)
+                        selectedCollectionID = nil
+                        selectedFilter = filter
+                    } label: {
+                        Text(filter.rawValue)
+                            .font(.caption.weight(.semibold))
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(
+                                isSelected
+                                    ? Color(red: 0.22, green: 0.52, blue: 0.96)
+                                    : Color.white.opacity(0.08),
+                                in: Capsule()
+                            )
+                            .foregroundStyle(.white)
+                    }
+                }
+
+                if !libraryManager.collections.isEmpty {
+                    Divider()
+                        .frame(height: 18)
+                        .background(Color.white.opacity(0.2))
+
+                    ForEach(libraryManager.collections) { collection in
+                        let isSelected = (selectedCollectionID == collection.id)
+                        Button {
+                            triggerHaptic(.light)
+                            selectedCollectionID = isSelected ? nil : collection.id
+                        } label: {
+                            HStack(spacing: 6) {
+                                Circle()
+                                    .fill(collection.accentColor)
+                                    .frame(width: 8, height: 8)
+                                Text(collection.name)
+                                    .font(.caption.weight(.semibold))
+                            }
+                            .padding(.horizontal, 12)
+                            .padding(.vertical, 7)
+                            .background(
+                                isSelected
+                                    ? collection.accentColor.opacity(0.35)
+                                    : Color.white.opacity(0.08),
+                                in: Capsule()
+                            )
+                            .overlay(
+                                Capsule()
+                                    .stroke(isSelected ? collection.accentColor : Color.clear, lineWidth: 1)
+                            )
+                            .foregroundStyle(.white)
+                        }
                         .contextMenu {
                             Button(role: .destructive) {
-                                library.deleteCollection(col)
+                                if selectedCollectionID == collection.id {
+                                    selectedCollectionID = nil
+                                }
+                                libraryManager.deleteCollection(collection)
                             } label: {
                                 Label("Delete Collection", systemImage: "trash")
                             }
                         }
-                }
-                Button(action: { showNewCollection = true }) {
-                    HStack(spacing: 4) {
-                        Image(systemName: "plus").font(.caption2.bold())
-                        Text("New").font(.caption.bold())
-                    }
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(Color(.tertiarySystemFill), in: Capsule())
-                }
-                .buttonStyle(.plain)
-            }
-            .padding(.horizontal, 16)
-        }
-    }
-
-    private func collectionChip(label: String, id: UUID?, color: Color) -> some View {
-        let isSelected = library.selectedCollectionID == id
-        return Button(action: {
-            UIImpactFeedbackGenerator(style: .light).impactOccurred()
-            library.selectedCollectionID = isSelected ? nil : id
-        }) {
-            Text(label)
-                .font(.caption.bold())
-                .foregroundStyle(isSelected ? .white : color)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(isSelected ? color : color.opacity(0.1), in: Capsule())
-        }
-        .buttonStyle(.plain)
-    }
-
-    // MARK: - Empty State
-
-    private var emptyState: some View {
-        VStack(spacing: 24) {
-            ZStack {
-                Circle()
-                    .fill(Color.cascadeBlue.opacity(0.1))
-                    .frame(width: 120, height: 120)
-                Image(systemName: "opticaldisc")
-                    .font(.system(size: 56))
-                    .foregroundStyle(Color.cascadeBlue.gradient)
-                    .modifier(PulseIfAvailable())
-            }
-            VStack(spacing: 8) {
-                Text("No Games Yet")
-                    .font(.title2.bold())
-                Text("Import PS2 game images in ISO, BIN/CUE, or CHD format.")
-                    .font(.body)
-                    .foregroundStyle(.secondary)
-                    .multilineTextAlignment(.center)
-                    .padding(.horizontal, 20)
-            }
-            VStack(spacing: 12) {
-                Button(action: requestGameImport) {
-                    Label("Import Game", systemImage: "plus.circle.fill")
-                        .font(.headline)
-                        .frame(maxWidth: 220)
-                        .padding(.vertical, 14)
-                        .background(Color.cascadeBlue.gradient)
-                        .foregroundColor(.white)
-                        .clipShape(RoundedRectangle(cornerRadius: 14))
-                        .shadow(color: Color.cascadeBlue.opacity(0.35), radius: 8, y: 4)
-                }
-                if !emulatorState.biosLoaded {
-                    Button(action: { openBIOSPicker() }) {
-                        Label("Import BIOS", systemImage: "cpu")
-                            .font(.subheadline)
-                            .frame(maxWidth: 220)
-                            .padding(.vertical, 12)
-                            .background(Color.orange.opacity(0.15))
-                            .foregroundColor(.orange)
-                            .clipShape(RoundedRectangle(cornerRadius: 14))
-                            .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color.orange.opacity(0.3), lineWidth: 1))
                     }
                 }
             }
         }
-        .padding(40)
     }
 
-    // MARK: - Importing Banner
-
-    private func importingBanner(text: String) -> some View {
-        HStack(spacing: 12) {
-            ProgressView()
-                .tint(Color.cascadeBlue)
-            Text(text)
-                .font(.subheadline.bold())
-            Spacer()
-        }
-        .padding(.horizontal, 18)
-        .padding(.vertical, 14)
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.cascadeBlue.opacity(0.3), lineWidth: 1))
-        .shadow(color: .black.opacity(0.2), radius: 12, y: 4)
-        .padding(.horizontal, 24)
-    }
-
-    // MARK: - No Results State
-
-    private var noResultsState: some View {
+    private var emptyStateView: some View {
         VStack(spacing: 14) {
-            Image(systemName: "magnifyingglass")
-                .font(.system(size: 40))
-                .foregroundStyle(.tertiary)
-            Text("No games match your filters")
+            Image(systemName: "opticaldisc")
+                .font(.system(size: 46))
+                .foregroundStyle(Color(red: 0.30, green: 0.62, blue: 1.0).opacity(0.85))
+
+            Text(libraryManager.games.isEmpty ? "No PS2 Games Yet" : "No Matching Games")
                 .font(.headline)
-                .foregroundStyle(.secondary)
-            if library.activeFilterCount > 0 {
-                Button(action: {
-                    library.clearFilters()
-                    library.searchText = ""
-                }) {
-                    Text("Clear Filters")
-                        .font(.subheadline)
-                        .foregroundStyle(Color.cascadeBlue)
-                }
-            }
-        }
-    }
+                .foregroundStyle(.white)
 
-    // MARK: - Toolbar Items
+            Text(
+                libraryManager.games.isEmpty
+                    ? "Import file ISO/BIN+CUE/CHD atau taruh langsung di Files app: On My iPhone → OREO-PS2 → games."
+                    : "Coba kata kunci atau filter koleksi lain."
+            )
+            .font(.subheadline)
+            .foregroundStyle(Color.white.opacity(0.65))
+            .multilineTextAlignment(.center)
+            .padding(.horizontal, 24)
 
-    private var biosWarningButton: some View {
-        Button(action: { openBIOSPicker() }) {
-            HStack(spacing: 4) {
-                Image(systemName: "exclamationmark.triangle.fill")
-                Text("BIOS")
-            }
-            .font(.caption.bold())
-            .foregroundColor(.orange)
-            .padding(.horizontal, 10)
-            .padding(.vertical, 5)
-            .background(Color.orange.opacity(0.12), in: Capsule())
-        }
-    }
-
-    private var addButton: some View {
-        Button(action: requestGameImport) {
-            Image(systemName: "plus").font(.body.bold())
-        }
-    }
-
-    private var filterButton: some View {
-        Menu {
-            Section("Format") {
-                Button(action: { library.formatFilter = nil }) {
-                    HStack {
-                        Text("All Formats")
-                        if library.formatFilter == nil { Image(systemName: "checkmark") }
-                    }
-                }
-                ForEach(["iso", "cue", "bin", "chd"], id: \.self) { fmt in
-                    let available = library.availableFormats.contains(fmt)
-                    Button(action: {
-                        library.formatFilter = library.formatFilter == fmt ? nil : fmt
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    }) {
-                        HStack {
-                            Text(fmt.uppercased())
-                            if !available { Text("(none)").foregroundStyle(.secondary) }
-                            if library.formatFilter == fmt { Image(systemName: "checkmark") }
+            if libraryManager.games.isEmpty {
+                HStack(spacing: 12) {
+                    if !emulatorState.biosLoaded {
+                        Button {
+                            triggerBIOSImport()
+                        } label: {
+                            Label("Import BIOS", systemImage: "cpu")
+                                .font(.subheadline.weight(.semibold))
+                                .padding(.horizontal, 16)
+                                .padding(.vertical, 10)
+                                .background(Color.orange, in: Capsule())
+                                .foregroundStyle(.white)
                         }
                     }
-                }
-            }
 
-            Section("Region") {
-                Button(action: { library.regionFilter = nil }) {
-                    HStack {
-                        Text("All Regions")
-                        if library.regionFilter == nil { Image(systemName: "checkmark") }
+                    Button {
+                        triggerGameImport()
+                    } label: {
+                        Label("Import Game", systemImage: "plus")
+                            .font(.subheadline.weight(.semibold))
+                            .padding(.horizontal, 16)
+                            .padding(.vertical, 10)
+                            .background(Color(red: 0.22, green: 0.52, blue: 0.96), in: Capsule())
+                            .foregroundStyle(.white)
                     }
                 }
-                ForEach(["NTSC-U", "PAL", "NTSC-J"], id: \.self) { region in
-                    let available = library.availableRegions.contains(region)
-                    Button(action: {
-                        library.regionFilter = library.regionFilter == region ? nil : region
-                        UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                    }) {
-                        HStack {
-                            Text(region)
-                            if !available { Text("(none)").foregroundStyle(.secondary) }
-                            if library.regionFilter == region { Image(systemName: "checkmark") }
+                .padding(.top, 4)
+            }
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 48)
+        .background(
+            RoundedRectangle(cornerRadius: 20, style: .continuous)
+                .fill(Color.white.opacity(0.04))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 20, style: .continuous)
+                        .stroke(Color.white.opacity(0.08), lineWidth: 1)
+                )
+        )
+    }
+
+    private var importingOverlay: some View {
+        ZStack {
+            Color.black.opacity(0.55)
+                .ignoresSafeArea()
+
+            VStack(spacing: 14) {
+                ProgressView()
+                    .scaleEffect(1.2)
+                    .tint(.white)
+
+                Text(libraryManager.importStatusMessage.isEmpty ? "Importing..." : libraryManager.importStatusMessage)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+
+                Text("Menyalin disc image dengan aman ke folder games...")
+                    .font(.caption)
+                    .foregroundStyle(Color.white.opacity(0.7))
+            }
+            .padding(24)
+            .background(
+                RoundedRectangle(cornerRadius: 18, style: .continuous)
+                    .fill(Color(red: 0.11, green: 0.15, blue: 0.24))
+            )
+        }
+    }
+
+    private var newCollectionSheet: some View {
+        NavigationStack {
+            Form {
+                Section("Collection Name") {
+                    TextField("e.g. RPG Classics, Racing", text: $newCollectionName)
+                }
+
+                Section("Badge Color") {
+                    HStack(spacing: 14) {
+                        ForEach(0..<GameCollection.palette.count, id: \.self) { idx in
+                            Circle()
+                                .fill(GameCollection.palette[idx])
+                                .frame(width: 30, height: 30)
+                                .overlay(
+                                    Circle()
+                                        .stroke(Color.primary, lineWidth: newCollectionColorIndex == idx ? 2.5 : 0)
+                                )
+                                .onTapGesture {
+                                    newCollectionColorIndex = idx
+                                }
                         }
                     }
+                    .padding(.vertical, 4)
                 }
             }
+            .navigationTitle("New Collection")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar {
+                ToolbarItem(placement: .cancellationAction) {
+                    Button("Cancel") {
+                        showNewCollectionSheet = false
+                    }
+                }
+                ToolbarItem(placement: .confirmationAction) {
+                    Button("Create") {
+                        libraryManager.createCollection(
+                            name: newCollectionName,
+                            colorIndex: newCollectionColorIndex
+                        )
+                        showNewCollectionSheet = false
+                    }
+                    .disabled(newCollectionName.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                }
+            }
+        }
+        .presentationDetents([.medium])
+    }
 
-            if library.activeFilterCount > 0 {
-                Divider()
-                Button(role: .destructive, action: {
-                    library.clearFilters()
-                    UIImpactFeedbackGenerator(style: .light).impactOccurred()
-                }) {
-                    Label("Clear All Filters", systemImage: "xmark.circle")
+    // MARK: - Folder Sync & Actions
+
+    private func syncFoldersAndBIOS(forceReloadBIOS: Bool) {
+        libraryManager.rescanFolders()
+
+        guard forceReloadBIOS || !emulatorState.biosLoaded else { return }
+        for biosURL in libraryManager.detectedBIOSFiles {
+            if let prepared = try? GameLibraryManager.prepareBIOSForEmulator(from: biosURL) {
+                emulatorState.importBIOS(from: prepared.url)
+                if prepared.isTemporary {
+                    try? FileManager.default.removeItem(at: prepared.url)
                 }
+            } else {
+                emulatorState.importBIOS(from: biosURL)
             }
-        } label: {
-            Image(systemName: library.activeFilterCount > 0
-                  ? "line.3.horizontal.decrease.circle.fill"
-                  : "line.3.horizontal.decrease.circle")
-                .foregroundStyle(library.activeFilterCount > 0 ? Color.cascadeBlue : Color.primary)
+            if emulatorState.biosLoaded {
+                break
+            }
         }
     }
 
-    private var sortMenu: some View {
-        Menu {
-            Picker("Sort by", selection: $library.sortOrder) {
-                ForEach(GameLibraryManager.SortOrder.allCases, id: \.self) { order in
-                    Text(order.rawValue).tag(order)
-                }
+    private func triggerGameImport() {
+        triggerHaptic(.light)
+        syncFoldersAndBIOS(forceReloadBIOS: !emulatorState.biosLoaded)
+
+        guard emulatorState.biosLoaded else {
+            showBIOSRequiredAlert = true
+            return
+        }
+
+        documentPicker.present(mode: .game) { urls in
+            Task {
+                await libraryManager.importGames(from: urls)
             }
-        } label: {
-            Image(systemName: "arrow.up.arrow.down")
         }
     }
 
-    // MARK: - Context Menu
+    private func triggerBIOSImport() {
+        triggerHaptic(.light)
+        documentPicker.present(mode: .bios) { urls in
+            for url in urls {
+                if let prepared = try? GameLibraryManager.prepareBIOSForEmulator(from: url) {
+                    emulatorState.importBIOS(from: prepared.url)
+                    if prepared.isTemporary {
+                        try? FileManager.default.removeItem(at: prepared.url)
+                    }
+                } else {
+                    emulatorState.importBIOS(from: url)
+                }
+            }
+            libraryManager.rescanFolders()
+        }
+    }
 
-    @ViewBuilder
-    private func gameContextMenu(game: GameEntry) -> some View {
-        Button { selectedGame = game } label: {
-            Label("Game Details", systemImage: "info.circle")
+    private func handleLaunch(_ game: GameEntry) {
+        triggerHaptic(.medium)
+        syncFoldersAndBIOS(forceReloadBIOS: !emulatorState.biosLoaded)
+
+        guard emulatorState.biosLoaded else {
+            showBIOSRequiredAlert = true
+            return
         }
-        Button { library.toggleFavorite(game) } label: {
-            Label(game.isFavorite ? "Remove Favorite" : "Add to Favorites",
-                  systemImage: game.isFavorite ? "heart.slash" : "heart")
-        }
-        Divider()
-        Button(role: .destructive) { library.removeGame(game) } label: {
-            Label("Remove from Library", systemImage: "trash")
-        }
+        libraryManager.markPlayed(game)
+        emulatorState.launch(game: game)
+    }
+
+    private func triggerHaptic(_ style: UIImpactFeedbackGenerator.FeedbackStyle) {
+        let generator = UIImpactFeedbackGenerator(style: style)
+        generator.impactOccurred()
     }
 }
 
-// MARK: - Game Card
+// MARK: - GameCardView
 
 struct GameCardView: View {
     let game: GameEntry
-    @EnvironmentObject var emulatorState: EmulatorState
-    @State private var pressed = false
+    let collection: GameCollection?
+    let onLaunch: () -> Void
+    let onToggleFavorite: () -> Void
+    let onRename: () -> Void
+    let onAssignCollection: (GameCollection?) -> Void
+    let onDelete: () -> Void
+    let collections: [GameCollection]
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            coverArt
-            gameInfo
-        }
-        .background(.ultraThinMaterial, in: RoundedRectangle(cornerRadius: 16))
-        .overlay(RoundedRectangle(cornerRadius: 16).stroke(Color.white.opacity(0.12), lineWidth: 1))
-        .shadow(color: .black.opacity(0.18), radius: 10, y: 5)
-        .scaleEffect(pressed ? 0.96 : 1.0)
-        .animation(.spring(response: 0.25, dampingFraction: 0.6), value: pressed)
-        .onLongPressGesture(minimumDuration: 0.01, maximumDistance: .infinity,
-                            pressing: { p in pressed = p }, perform: {})
-    }
+        VStack(alignment: .leading, spacing: 10) {
+            ZStack(alignment: .topTrailing) {
+                RoundedRectangle(cornerRadius: 12, style: .continuous)
+                    .fill(
+                        LinearGradient(
+                            colors: [
+                                (collection?.accentColor ?? Color(red: 0.20, green: 0.44, blue: 0.88)).opacity(0.45),
+                                Color(red: 0.09, green: 0.12, blue: 0.20)
+                            ],
+                            startPoint: .topLeading,
+                            endPoint: .bottomTrailing
+                        )
+                    )
+                    .frame(height: 112)
+                    .overlay(
+                        VStack(spacing: 6) {
+                            Image(systemName: "opticaldisc.fill")
+                                .font(.system(size: 32))
+                                .foregroundStyle(.white.opacity(0.88))
 
-    private var coverArt: some View {
-        ZStack {
-            RoundedRectangle(cornerRadius: 12)
-                .fill(coverGradient)
-                .aspectRatio(3/4, contentMode: .fit)
-            VStack(spacing: 10) {
-                Image(systemName: "opticaldisc.fill")
-                    .font(.system(size: 34))
-                    .foregroundColor(.white.opacity(0.85))
-                if !game.discID.isEmpty {
-                    Text(game.discID)
-                        .font(.caption2.monospaced())
-                        .foregroundColor(.white.opacity(0.6))
-                        .padding(.horizontal, 8)
-                        .padding(.vertical, 3)
-                        .background(.black.opacity(0.25), in: Capsule())
+                            Text(game.discID)
+                                .font(.caption2.monospaced().weight(.semibold))
+                                .foregroundStyle(.white.opacity(0.82))
+                        }
+                    )
+
+                Button(action: onToggleFavorite) {
+                    Image(systemName: game.isFavorite ? "heart.fill" : "heart")
+                        .font(.caption.weight(.bold))
+                        .foregroundStyle(game.isFavorite ? Color.pink : Color.white.opacity(0.8))
+                        .padding(7)
+                        .background(Color.black.opacity(0.35), in: Circle())
+                }
+                .padding(6)
+            }
+
+            VStack(alignment: .leading, spacing: 4) {
+                Text(game.title)
+                    .font(.subheadline.weight(.semibold))
+                    .foregroundStyle(.white)
+                    .lineLimit(2)
+                    .frame(height: 38, alignment: .topLeading)
+
+                HStack(spacing: 6) {
+                    Text(game.regionBadge)
+                        .font(.caption2.weight(.bold))
+                        .padding(.horizontal, 6)
+                        .padding(.vertical, 2)
+                        .background(Color.white.opacity(0.12), in: RoundedRectangle(cornerRadius: 5, style: .continuous))
+                        .foregroundStyle(.white.opacity(0.9))
+
+                    Text(game.formattedFileSize)
+                        .font(.caption2)
+                        .foregroundStyle(.white.opacity(0.6))
+                        .lineLimit(1)
                 }
             }
-            VStack {
-                HStack {
-                    Text(game.url.pathExtension.uppercased())
-                        .font(.system(size: 9, weight: .bold, design: .monospaced))
-                        .foregroundColor(.white.opacity(0.85))
-                        .padding(.horizontal, 6)
-                        .padding(.vertical, 3)
-                        .background(.black.opacity(0.3), in: Capsule())
-                        .padding(8)
-                    Spacer()
-                    if game.isFavorite {
-                        Image(systemName: "heart.fill")
-                            .font(.caption)
-                            .foregroundColor(.red)
-                            .padding(6)
-                            .background(.ultraThinMaterial, in: Circle())
-                            .padding(8)
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: 16, style: .continuous)
+                .fill(Color.white.opacity(0.06))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 16, style: .continuous)
+                        .stroke(Color.white.opacity(0.10), lineWidth: 1)
+                )
+        )
+        .contentShape(RoundedRectangle(cornerRadius: 16, style: .continuous))
+        .onTapGesture(perform: onLaunch)
+        .contextMenu {
+            Button(action: onLaunch) {
+                Label("Play Game", systemImage: "play.fill")
+            }
+
+            Button(action: onToggleFavorite) {
+                Label(
+                    game.isFavorite ? "Remove from Favorites" : "Add to Favorites",
+                    systemImage: game.isFavorite ? "heart.slash" : "heart"
+                )
+            }
+
+            Button(action: onRename) {
+                Label("Rename", systemImage: "pencil")
+            }
+
+            if !collections.isEmpty {
+                Menu("Move to Collection") {
+                    Button("None") {
+                        onAssignCollection(nil)
+                    }
+                    ForEach(collections) { col in
+                        Button(col.name) {
+                            onAssignCollection(col)
+                        }
                     }
                 }
-                Spacer()
+            }
+
+            Divider()
+
+            Button(role: .destructive, action: onDelete) {
+                Label("Delete Game", systemImage: "trash")
             }
         }
-        .clipShape(RoundedRectangle(cornerRadius: 12))
     }
-
-    private var gameInfo: some View {
-        VStack(alignment: .leading, spacing: 3) {
-            Text(game.title)
-                .font(.subheadline.bold())
-                .lineLimit(2)
-                .padding(.top, 8)
-            HStack {
-                Text(game.region)
-                    .font(.caption2.bold())
-                    .foregroundStyle(.secondary)
-                    .padding(.horizontal, 6)
-                    .padding(.vertical, 2)
-                    .background(Color(.tertiarySystemFill), in: Capsule())
-                Spacer()
-                if let lp = game.lastPlayed {
-                    Text(lp, style: .relative)
-                        .font(.caption2)
-                        .foregroundStyle(.tertiary)
-                }
-            }
-        }
-        .padding(.horizontal, 6)
-        .padding(.bottom, 10)
-    }
-
-    private var coverGradient: AnyShapeStyle {
-        let seed = abs(game.id.hashValue)
-        let hue  = Double(seed % 360) / 360.0
-        return AnyShapeStyle(LinearGradient(
-            colors: [
-                Color(hue: hue, saturation: 0.5, brightness: 0.5),
-                Color(hue: (hue + 0.2).truncatingRemainder(dividingBy: 1), saturation: 0.6, brightness: 0.32)
-            ],
-            startPoint: .topLeading, endPoint: .bottomTrailing
-        ))
-    }
-}
-
-// MARK: - Color Extension
-
-extension Color {
-    static let cascadeBlue = Color(red: 0.2, green: 0.55, blue: 1.0)
 }
