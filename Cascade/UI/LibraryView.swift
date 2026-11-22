@@ -12,6 +12,8 @@ struct LibraryView: View {
 
     @State private var showFileImporter  = false
     @State private var importMode: ImportMode = .game
+    @State private var isImportingBIOS   = false
+    @State private var biosStatusAlert: String?
     @State private var showNoBIOSAlert   = false
     @State private var showNewCollection = false
     @State private var newCollectionName = ""
@@ -66,23 +68,20 @@ struct LibraryView: View {
                             library.importGame(from: url)
                         }
                     case .bios:
-                        // Pick the primary .bin file even if all companion BIOS files (.ROM1, .NVM, .MEC, etc.) are selected
-                        if let biosURL = urls.first(where: { $0.pathExtension.lowercased() == "bin" }) ?? urls.first {
-                            emulatorState.importBIOS(from: biosURL)
-                        }
+                        handleBIOSSelection(urls)
                     }
                 case .failure(let error):
                     library.importError = error.localizedDescription
                 }
             }
             .overlay(alignment: .bottom) {
-                if library.isImporting {
-                    importingBanner
+                if library.isImporting || isImportingBIOS {
+                    importingBanner(text: isImportingBIOS ? "Importing BIOS…" : "Importing game…")
                         .padding(.bottom, 24)
                         .transition(.move(edge: .bottom).combined(with: .opacity))
                 }
             }
-            .animation(.spring(response: 0.35), value: library.isImporting)
+            .animation(.spring(response: 0.35), value: library.isImporting || isImportingBIOS)
             .alert("Import Failed", isPresented: Binding(
                 get: { library.importError != nil },
                 set: { if !$0 { library.importError = nil } }
@@ -90,6 +89,14 @@ struct LibraryView: View {
                 Button("OK") { library.importError = nil }
             } message: {
                 Text(library.importError ?? "")
+            }
+            .alert("BIOS Import", isPresented: Binding(
+                get: { biosStatusAlert != nil },
+                set: { if !$0 { biosStatusAlert = nil } }
+            )) {
+                Button("OK") { biosStatusAlert = nil }
+            } message: {
+                Text(biosStatusAlert ?? "")
             }
             // No BIOS alert — defer fileImporter presentation until alert finishes dismissing
             .alert("No BIOS Detected", isPresented: $showNoBIOSAlert) {
@@ -118,6 +125,81 @@ struct LibraryView: View {
                 Button("Cancel", role: .cancel) { newCollectionName = "" }
             }
         }
+    }
+
+    // MARK: - BIOS Import Handler (Security-Scoped -> Local Sandbox)
+
+    private func handleBIOSSelection(_ urls: [URL]) {
+        guard !urls.isEmpty else { return }
+        isImportingBIOS = true
+
+        let scopedURLs: [(url: URL, accessed: Bool)] = urls.map { url in
+            (url, url.startAccessingSecurityScopedResource())
+        }
+
+        Task.detached(priority: .userInitiated) {
+            defer {
+                for item in scopedURLs where item.accessed {
+                    item.url.stopAccessingSecurityScopedResource()
+                }
+            }
+
+            do {
+                let fm = FileManager.default
+                let supportDir = fm.urls(for: .applicationSupportDirectory, in: .userDomainMask).first!
+                let biosDir = supportDir.appendingPathComponent("bios", isDirectory: true)
+                try fm.createDirectory(at: biosDir, withIntermediateDirectories: true)
+
+                var localBinURL: URL?
+
+                for item in scopedURLs {
+                    let srcURL = item.url
+                    let destURL = biosDir.appendingPathComponent(srcURL.lastPathComponent)
+                    try Self.coordinatedCopy(from: srcURL, to: destURL)
+
+                    if srcURL.pathExtension.lowercased() == "bin" {
+                        localBinURL = destURL
+                    }
+                }
+
+                let targetURL = localBinURL ?? biosDir.appendingPathComponent(scopedURLs[0].url.lastPathComponent)
+
+                await MainActor.run {
+                    emulatorState.importBIOS(from: targetURL)
+                    isImportingBIOS = false
+                    if !emulatorState.biosLoaded {
+                        biosStatusAlert = "File BIOS (\(targetURL.lastPathComponent)) sudah disalin ke sandbox, tetapi ditolak oleh core emulator. Pastikan memilih file .BIN utama berukuran 4 MB (contoh: SCPH-70004_BIOS_V12_PAL_200.BIN)."
+                    }
+                }
+            } catch {
+                let msg = error.localizedDescription
+                await MainActor.run {
+                    isImportingBIOS = false
+                    biosStatusAlert = "Gagal menyalin file BIOS: \(msg)"
+                }
+            }
+        }
+    }
+
+    private nonisolated static func coordinatedCopy(from srcURL: URL, to destURL: URL) throws {
+        let fm = FileManager.default
+        var coordinatorError: NSError?
+        var copyError: Error?
+
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: srcURL, options: .withoutChanges, error: &coordinatorError) { coordinatedURL in
+            do {
+                if fm.fileExists(atPath: destURL.path) {
+                    try fm.removeItem(at: destURL)
+                }
+                try fm.copyItem(at: coordinatedURL, to: destURL)
+            } catch {
+                copyError = error
+            }
+        }
+
+        if let coordinatorError { throw coordinatorError }
+        if let copyError { throw copyError }
     }
 
     // MARK: - File Importer Presentation
@@ -413,11 +495,11 @@ struct LibraryView: View {
 
     // MARK: - Importing Banner
 
-    private var importingBanner: some View {
+    private func importingBanner(text: String) -> some View {
         HStack(spacing: 12) {
             ProgressView()
                 .tint(Color.cascadeBlue)
-            Text("Importing game…")
+            Text(text)
                 .font(.subheadline.bold())
             Spacer()
         }
