@@ -29,6 +29,9 @@ struct GameEntry: Identifiable, Codable, Hashable, Sendable {
         return primaryURL
     }
 
+    /// Alias compatibility for views and state controllers expecting `game.url`
+    var url: URL { fileURL }
+
     var formattedFileSize: String {
         ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
     }
@@ -156,11 +159,11 @@ final class GameLibraryManager: ObservableObject {
     @Published var importStatusMessage: String = ""
     @Published var lastImportError: String?
 
-    static let supportedGameExtensions: Set<String> = ["iso", "bin", "cue", "chd", "gz", "cso"]
-    static let supportedBIOSExtensions: Set<String> = ["bin", "rom", "nvm", "mec"]
+    nonisolated static let supportedGameExtensions: Set<String> = ["iso", "bin", "cue", "chd", "gz", "cso"]
+    nonisolated static let supportedBIOSExtensions: Set<String> = ["bin", "rom", "nvm", "mec"]
 
-    static let biosPlaceholderFileName = "put your bios here.txt"
-    static let gamesPlaceholderFileName = "put your iso here.txt"
+    nonisolated static let biosPlaceholderFileName = "put your bios here.txt"
+    nonisolated static let gamesPlaceholderFileName = "put your iso here.txt"
 
     // MARK: - Public Sandbox Directories (Visible in iOS Files App: On My iPhone -> OREO-PS2)
 
@@ -431,6 +434,10 @@ final class GameLibraryManager: ObservableObject {
         saveLibrary()
     }
 
+    func updateLastPlayed(_ game: GameEntry) {
+        markPlayed(game)
+    }
+
     func renameGame(_ game: GameEntry, newTitle: String) {
         let trimmed = newTitle.trimmingCharacters(in: .whitespacesAndNewlines)
         guard !trimmed.isEmpty, let idx = games.firstIndex(where: { $0.id == game.id }) else { return }
@@ -442,6 +449,13 @@ final class GameLibraryManager: ObservableObject {
         guard let idx = games.firstIndex(where: { $0.id == game.id }) else { return }
         games[idx].collectionID = collection?.id
         saveLibrary()
+    }
+
+    func isGame(_ game: GameEntry, in collection: GameCollection) -> Bool {
+        if let current = games.first(where: { $0.id == game.id }) {
+            return current.collectionID == collection.id
+        }
+        return game.collectionID == collection.id
     }
 
     func deleteGame(_ game: GameEntry) {
@@ -634,8 +648,8 @@ final class GameLibraryManager: ObservableObject {
     }
 
     nonisolated static func parseBinFilenames(inCueAt cueURL: URL) -> [String] {
-        guard let content = try? String(contentsOf: cueURL, encoding: .utf8)
-            ?? String(contentsOf: cueURL, encoding: .ascii) else {
+        guard let content = (try? String(contentsOf: cueURL, encoding: .utf8))
+            ?? (try? String(contentsOf: cueURL, encoding: .ascii)) else {
             return []
         }
 
