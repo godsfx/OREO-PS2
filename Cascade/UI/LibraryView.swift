@@ -5,8 +5,13 @@ struct LibraryView: View {
     @EnvironmentObject var library: GameLibraryManager
     @EnvironmentObject var emulatorState: EmulatorState
 
-    @State private var showGameImporter  = false
-    @State private var showBIOSImporter  = false
+    private enum ImportMode {
+        case game
+        case bios
+    }
+
+    @State private var showFileImporter  = false
+    @State private var importMode: ImportMode = .game
     @State private var showNoBIOSAlert   = false
     @State private var showNewCollection = false
     @State private var newCollectionName = ""
@@ -46,14 +51,28 @@ struct LibraryView: View {
                     addButton
                 }
             }
-            // Game file importer — separate from BIOS importer for reliability
+            // Single unified file importer to prevent SwiftUI multiple-.fileImporter conflicts
             .fileImporter(
-                isPresented: $showGameImporter,
-                allowedContentTypes: [.item],
+                isPresented: $showFileImporter,
+                allowedContentTypes: [.item, .data],
                 allowsMultipleSelection: true
             ) { result in
-                if case .success(let urls) = result {
-                    for url in urls { library.importGame(from: url) }
+                switch result {
+                case .success(let urls):
+                    guard !urls.isEmpty else { return }
+                    switch importMode {
+                    case .game:
+                        for url in urls {
+                            library.importGame(from: url)
+                        }
+                    case .bios:
+                        // Pick the primary .bin file even if all companion BIOS files (.ROM1, .NVM, .MEC, etc.) are selected
+                        if let biosURL = urls.first(where: { $0.pathExtension.lowercased() == "bin" }) ?? urls.first {
+                            emulatorState.importBIOS(from: biosURL)
+                        }
+                    }
+                case .failure(let error):
+                    library.importError = error.localizedDescription
                 }
             }
             .overlay(alignment: .bottom) {
@@ -72,24 +91,14 @@ struct LibraryView: View {
             } message: {
                 Text(library.importError ?? "")
             }
-            // BIOS file importer
-            .fileImporter(
-                isPresented: $showBIOSImporter,
-                allowedContentTypes: [.item],
-                allowsMultipleSelection: false
-            ) { result in
-                if case .success(let urls) = result, let url = urls.first {
-                    emulatorState.importBIOS(from: url)
-                }
-            }
-            // No BIOS alert — shown when tapping Add Game without a BIOS loaded
+            // No BIOS alert — defer fileImporter presentation until alert finishes dismissing
             .alert("No BIOS Detected", isPresented: $showNoBIOSAlert) {
                 Button("Import BIOS") {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    showBIOSImporter = true
+                    presentImporter(.bios, afterAlertDismissal: true)
                 }
                 Button("Add Game Anyway", role: .none) {
-                    showGameImporter = true
+                    presentImporter(.game, afterAlertDismissal: true)
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
@@ -111,12 +120,25 @@ struct LibraryView: View {
         }
     }
 
+    // MARK: - File Importer Presentation
+
+    private func presentImporter(_ mode: ImportMode, afterAlertDismissal: Bool = false) {
+        importMode = mode
+        if afterAlertDismissal {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
+                showFileImporter = true
+            }
+        } else {
+            showFileImporter = true
+        }
+    }
+
     // MARK: - Add Game Action (BIOS-gated)
 
     private func requestGameImport() {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         if emulatorState.biosLoaded {
-            showGameImporter = true
+            presentImporter(.game)
         } else {
             showNoBIOSAlert = true
         }
@@ -373,7 +395,7 @@ struct LibraryView: View {
                         .shadow(color: Color.cascadeBlue.opacity(0.35), radius: 8, y: 4)
                 }
                 if !emulatorState.biosLoaded {
-                    Button(action: { showBIOSImporter = true }) {
+                    Button(action: { presentImporter(.bios) }) {
                         Label("Import BIOS", systemImage: "cpu")
                             .font(.subheadline)
                             .frame(maxWidth: 220)
@@ -433,7 +455,7 @@ struct LibraryView: View {
     // MARK: - Toolbar Items
 
     private var biosWarningButton: some View {
-        Button(action: { showBIOSImporter = true }) {
+        Button(action: { presentImporter(.bios) }) {
             HStack(spacing: 4) {
                 Image(systemName: "exclamationmark.triangle.fill")
                 Text("BIOS")
