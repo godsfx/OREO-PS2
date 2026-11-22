@@ -320,7 +320,7 @@ struct LibraryView: View {
             }
 
             HStack {
-                Text(emulatorState.status)
+                Text(String(describing: emulatorState.status))
                     .font(.caption)
                     .foregroundStyle(Color.white.opacity(0.68))
                     .lineLimit(1)

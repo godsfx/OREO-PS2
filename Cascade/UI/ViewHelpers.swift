@@ -1,6 +1,12 @@
 import SwiftUI
 import UIKit
 
+// MARK: - Brand Colors
+
+extension Color {
+    static let cascadeBlue = Color(red: 0.14, green: 0.45, blue: 0.95)
+}
+
 // MARK: - iOS-version-gated view modifiers
 
 /// Applies `.symbolEffect(.pulse)` on iOS 17+ and is a no-op on earlier versions.
