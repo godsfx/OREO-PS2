@@ -13,6 +13,7 @@ struct GameEntry: Identifiable, Codable, Hashable, Sendable {
     var fileSize: Int64
     var addedDate: Date
     var lastPlayedDate: Date?
+    var totalPlayTime: TimeInterval
     var isFavorite: Bool
     var collectionID: UUID?
 
@@ -31,6 +32,12 @@ struct GameEntry: Identifiable, Codable, Hashable, Sendable {
 
     /// Alias compatibility for views and state controllers expecting `game.url`
     var url: URL { fileURL }
+
+    /// Alias compatibility for views expecting `game.lastPlayed`
+    var lastPlayed: Date? {
+        get { lastPlayedDate }
+        set { lastPlayedDate = newValue }
+    }
 
     var formattedFileSize: String {
         ByteCountFormatter.string(fromByteCount: fileSize, countStyle: .file)
@@ -58,6 +65,7 @@ struct GameEntry: Identifiable, Codable, Hashable, Sendable {
         fileSize: Int64 = 0,
         addedDate: Date = Date(),
         lastPlayedDate: Date? = nil,
+        totalPlayTime: TimeInterval = 0,
         isFavorite: Bool = false,
         collectionID: UUID? = nil
     ) {
@@ -69,8 +77,28 @@ struct GameEntry: Identifiable, Codable, Hashable, Sendable {
         self.fileSize = fileSize
         self.addedDate = addedDate
         self.lastPlayedDate = lastPlayedDate
+        self.totalPlayTime = totalPlayTime
         self.isFavorite = isFavorite
         self.collectionID = collectionID
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case id, title, discID, region, fileName, fileSize, addedDate, lastPlayedDate, totalPlayTime, isFavorite, collectionID
+    }
+
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        id = try c.decodeIfPresent(UUID.self, forKey: .id) ?? UUID()
+        title = try c.decode(String.self, forKey: .title)
+        discID = try c.decodeIfPresent(String.self, forKey: .discID) ?? "PS2-DISC"
+        region = try c.decodeIfPresent(String.self, forKey: .region) ?? "PS2"
+        fileName = try c.decode(String.self, forKey: .fileName)
+        fileSize = try c.decodeIfPresent(Int64.self, forKey: .fileSize) ?? 0
+        addedDate = try c.decodeIfPresent(Date.self, forKey: .addedDate) ?? Date()
+        lastPlayedDate = try c.decodeIfPresent(Date.self, forKey: .lastPlayedDate)
+        totalPlayTime = try c.decodeIfPresent(TimeInterval.self, forKey: .totalPlayTime) ?? 0
+        isFavorite = try c.decodeIfPresent(Bool.self, forKey: .isFavorite) ?? false
+        collectionID = try c.decodeIfPresent(UUID.self, forKey: .collectionID)
     }
 
     init(url: URL) {
@@ -124,6 +152,13 @@ struct GameCollection: Identifiable, Codable, Hashable, Sendable {
     var accentColor: Color {
         Self.palette[abs(colorIndex) % Self.palette.count]
     }
+
+    /// Alias compatibility for views expecting `collection.color`
+    var color: Color { accentColor }
+
+    /// Default SF Symbol aliases for views expecting collection icons
+    var icon: String { "folder.fill" }
+    var systemImage: String { "folder.fill" }
 }
 
 // MARK: - Import Error
@@ -456,6 +491,28 @@ final class GameLibraryManager: ObservableObject {
             return current.collectionID == collection.id
         }
         return game.collectionID == collection.id
+    }
+
+    func toggleGame(_ game: GameEntry, in collection: GameCollection) {
+        if isGame(game, in: collection) {
+            assignGame(game, to: nil)
+        } else {
+            assignGame(game, to: collection)
+        }
+    }
+
+    func toggle(_ game: GameEntry, in collection: GameCollection) {
+        toggleGame(game, in: collection)
+    }
+
+    func addGame(_ game: GameEntry, to collection: GameCollection) {
+        assignGame(game, to: collection)
+    }
+
+    func removeGame(_ game: GameEntry, from collection: GameCollection) {
+        if isGame(game, in: collection) {
+            assignGame(game, to: nil)
+        }
     }
 
     func deleteGame(_ game: GameEntry) {
