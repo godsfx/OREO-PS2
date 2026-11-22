@@ -1,14 +1,14 @@
 name: OREO iOS Build
 
-# Put this file at:  .github/workflows/oreo-build-ios.yml  in your fork of Leviidev/Cascade.
-# Run it from the Actions tab -> "OREO iOS Build" -> "Run workflow".
-# It builds an UNSIGNED .ipa for sideloading (Sideloadly / AltStore re-sign it with your Apple ID).
+# Simpan file ini di: .github/workflows/oreo-build-ios.yml pada fork Leviidev/Cascade milikmu.
+# Jalankan dari tab Actions -> "OREO iOS Build" -> "Run workflow".
+# Menghasilkan file .ipa siap sideload (TrollStore iOS 16.5 dengan ldid fake-sign, atau AltStore / SideStore / Sideloadly).
 #
-# What it does on top of a plain build:
-#   * applies the import fixes (several files at once, BIN+CUE together, CHD, library survives re-install)
-#   * renames the app (default "OREO") and changes the bundle id
-#
-# You can also run it in an EMPTY repo of your own: set "source_repo" to Leviidev/Cascade.
+# Fitur tambahan di atas build standar:
+#   * Menerapkan patch import fix (multi-file sekaligus, BIN+CUE bersamaan, CHD, library tetap aman saat re-install)
+#   * Mengubah nama aplikasi (default "OREO") dan Bundle ID
+#   * Otomatis resize AppIcon ke 1024x1024
+#   * Fake-sign dengan ldid -S beserta entitlements JIT & memori tambahan untuk TrollStore iOS 16.5
 
 on:
   workflow_dispatch:
@@ -48,7 +48,7 @@ on:
         options: [macos-15, macos-latest, macos-14]
         default: macos-15
       xcode_version:
-        description: "Build: Xcode version such as 16.2 (empty = runner default)"
+        description: "Build: Xcode version such as 16.2 (empty = auto-select latest on runner)"
         type: string
         default: ""
       extra_xcodebuild_args:
@@ -56,10 +56,10 @@ on:
         type: string
         default: ""
       codesign_mode:
-        description: "Package: ad-hoc sign the app, or leave it unsigned"
+        description: "Package: ldid fake-sign (TrollStore), adhoc codesign, or unsigned"
         type: choice
-        options: [adhoc, none]
-        default: adhoc
+        options: [ldid, adhoc, none]
+        default: ldid
       ipa_name:
         description: "Package: output file name without .ipa"
         type: string
@@ -119,7 +119,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
         with:
-          repository: ${{ inputs.source_repo }}
+          repository: ${{ inputs.source_repo || github.repository }}
           ref: ${{ inputs.ref }}
 
       - name: Apply OREO import fixes
@@ -725,12 +725,30 @@ jobs:
           OREO_PATCH_EOF
           if git apply --reverse --check "$RUNNER_TEMP/oreo-import-fixes.patch" 2>/dev/null; then
             echo "Import fixes are already present in this source, skipping."
-          elif git apply --check "$RUNNER_TEMP/oreo-import-fixes.patch"; then
+          elif git apply --check "$RUNNER_TEMP/oreo-import-fixes.patch" 2>/dev/null; then
             git apply --whitespace=nowarn "$RUNNER_TEMP/oreo-import-fixes.patch"
             echo "Applied import fixes."
+          elif git apply --check -C1 "$RUNNER_TEMP/oreo-import-fixes.patch" 2>/dev/null; then
+            git apply --whitespace=nowarn -C1 "$RUNNER_TEMP/oreo-import-fixes.patch"
+            echo "Applied import fixes (with reduced context)."
           else
-            echo "::error::The import fixes do not match this version of the source. Re-run with apply_fixes turned off, or set ref to the commit the fixes were written for (090a81d)."
+            echo "::error::The import fixes do not match this version of the source. Re-run with apply_fixes turned off, or set ref to commit 090a81d."
             exit 1
+          fi
+
+      - name: Resize AppIcon to 1024x1024
+        run: |
+          ICON="Cascade/Assets.xcassets/AppIcon.appiconset/icon.png"
+          if [[ -f "$ICON" ]]; then
+            ACTUAL=$(sips -g pixelWidth "$ICON" 2>/dev/null | awk '/pixelWidth/{print $2}')
+            if [[ -n "$ACTUAL" && "$ACTUAL" != "1024" ]]; then
+              echo "Resizing icon from ${ACTUAL}px to 1024px"
+              sips -z 1024 1024 "$ICON"
+            else
+              echo "Icon is already 1024x1024"
+            fi
+          else
+            echo "AppIcon path not found at $ICON, skipping resize."
           fi
 
       - name: Rename app
@@ -741,38 +759,54 @@ jobs:
           name = os.environ["APP_NAME"]
           changed = 0
 
-          # Info.plist: display name and the permission texts
-          plist = pathlib.Path("Cascade/App/Info.plist")
-          text = plist.read_text()
-          new = text.replace("Cascade", name)
-          if new == text:
-              raise SystemExit("Did not find the app name in Info.plist (project layout changed?)")
-          plist.write_text(new)
+          # Info.plist: display name and permission texts
+          plist_candidates = [
+              pathlib.Path("Cascade/App/Info.plist"),
+              pathlib.Path("Cascade/Info.plist"),
+          ]
+          plist = next((p for p in plist_candidates if p.exists()), None)
+          if plist is not None:
+              text = plist.read_text()
+              new = text.replace("Cascade", name)
+              if name != "Cascade" and new == text:
+                  print(f"Warning: 'Cascade' not found in {plist}, relying on INFOPLIST_KEY_CFBundleDisplayName")
+              elif new != text:
+                  plist.write_text(new)
+          else:
+              print("Warning: Info.plist not found in standard paths, relying on INFOPLIST_KEY_CFBundleDisplayName")
 
           # Swift sources: only text inside string literals that mention the app name
-          literal = re.compile(r'"(?:[^"\\\n]|\\.)*"')
-          for path in pathlib.Path("Cascade").rglob("*.swift"):
-              src = path.read_text()
-              out = literal.sub(lambda m: m.group(0).replace("Cascade", name) if "Cascade" in m.group(0) else m.group(0), src)
-              if out != src:
-                  path.write_text(out)
-                  changed += 1
-          print(f"Renamed to {name!r} in Info.plist and {changed} Swift file(s)")
+          if name != "Cascade":
+              literal = re.compile(r'"(?:[^"\\\n]|\\.)*"')
+              for path in pathlib.Path("Cascade").rglob("*.swift"):
+                  src = path.read_text()
+                  out = literal.sub(
+                      lambda m: m.group(0).replace("Cascade", name) if "Cascade" in m.group(0) else m.group(0),
+                      src,
+                  )
+                  if out != src:
+                      path.write_text(out)
+                      changed += 1
+          print(f"Configured app name {name!r} (updated {changed} Swift file(s))")
           PY
 
       - name: Select Xcode
-        if: ${{ inputs.xcode_version != '' }}
         run: |
-          DIR="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
-          if [[ ! -d "$DIR" ]]; then
-            echo "::error::Xcode $XCODE_VERSION is not on this runner. Installed versions:"
-            ls /Applications | grep -i xcode || true
-            exit 1
+          if [[ -n "$XCODE_VERSION" ]]; then
+            DIR="/Applications/Xcode_${XCODE_VERSION}.app/Contents/Developer"
+            if [[ ! -d "$DIR" ]]; then
+              echo "::error::Xcode $XCODE_VERSION is not on this runner. Installed versions:"
+              ls /Applications | grep -i xcode || true
+              exit 1
+            fi
+            sudo xcode-select -s "$DIR"
+          else
+            LATEST=$(ls /Applications | grep -E '^Xcode_[0-9]' | sort -V | tail -1 || true)
+            if [[ -n "$LATEST" && -d "/Applications/$LATEST/Contents/Developer" ]]; then
+              sudo xcode-select -s "/Applications/$LATEST/Contents/Developer"
+              echo "Auto-selected latest Xcode: $LATEST"
+            fi
           fi
-          sudo xcode-select -s "$DIR"
-
-      - name: Show toolchain
-        run: |
           xcodebuild -version
           swift --version
 
@@ -793,6 +827,7 @@ jobs:
             CODE_SIGN_IDENTITY=
             DEVELOPMENT_TEAM=
             "PRODUCT_BUNDLE_IDENTIFIER=$BUNDLE_ID"
+            "INFOPLIST_KEY_CFBundleDisplayName=$APP_NAME"
           )
           if [[ -n "$DEPLOYMENT_TARGET" ]]; then
             args+=("IPHONEOS_DEPLOYMENT_TARGET=$DEPLOYMENT_TARGET")
@@ -805,18 +840,72 @@ jobs:
           xcodebuild "${args[@]}" 2>&1 | tee build/xcodebuild.log
 
       - name: Show build errors
-        if: ${{ failure() }}
+        if: ${ failure() }
         run: |
           echo "---- first errors from the build log ----"
           grep -n "error:" build/xcodebuild.log | head -40 || true
 
-      - name: Package IPA
+      - name: Package IPA (TrollStore ldid / Unsigned)
         run: |
+          set -e
           APP="$(find build/App.xcarchive/Products/Applications -maxdepth 1 -name '*.app' | head -1)"
           [[ -n "$APP" ]] || { echo "::error::No .app found in the archive"; exit 1; }
-          if [[ "$CODESIGN_MODE" == "adhoc" ]]; then
-            codesign -f -s - "$APP"
+
+          # Prepare entitlements (merge project entitlements + TrollStore JIT/memory keys)
+          TMP_ENT="$RUNNER_TEMP/trollstore.entitlements"
+          EMPTY_ENT="$RUNNER_TEMP/empty.entitlements"
+          cat > "$EMPTY_ENT" <<'PLIST_EOF'
+          <?xml version="1.0" encoding="UTF-8"?>
+          <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+          <plist version="1.0">
+          <dict/>
+          </plist>
+          PLIST_EOF
+
+          ENT_FILE="$(find Cascade -maxdepth 3 -name '*.entitlements' | head -1 || true)"
+          if [[ -n "$ENT_FILE" && -f "$ENT_FILE" ]]; then
+            cp "$ENT_FILE" "$TMP_ENT"
+          else
+            cp "$EMPTY_ENT" "$TMP_ENT"
           fi
+
+          for key in \
+            "get-task-allow" \
+            "com.apple.developer.kernel.increased-memory-limit" \
+            "com.apple.developer.kernel.extended-virtual-addressing" \
+            "com.apple.security.cs.allow-jit" \
+            "com.apple.security.cs.allow-unsigned-executable-memory"; do
+            /usr/libexec/PlistBuddy -c "Delete :$key" "$TMP_ENT" 2>/dev/null || true
+            /usr/libexec/PlistBuddy -c "Add :$key bool true" "$TMP_ENT"
+          done
+
+          if [[ "$CODESIGN_MODE" == "ldid" ]]; then
+            command -v ldid >/dev/null 2>&1 || brew install ldid
+            codesign --remove-signature "$APP" 2>/dev/null || true
+
+            # Fake-sign nested frameworks, dylibs, and app extensions first
+            if [[ -d "$APP/Frameworks" ]]; then
+              find "$APP/Frameworks" -type f -name "*.dylib" -exec ldid -S"$EMPTY_ENT" {} +
+              find "$APP/Frameworks" -maxdepth 1 -name "*.framework" -exec ldid -S"$EMPTY_ENT" {} +
+            fi
+            if [[ -d "$APP/PlugIns" ]]; then
+              find "$APP/PlugIns" -maxdepth 1 -name "*.appex" -exec ldid -S"$TMP_ENT" {} +
+            fi
+
+            # Fake-sign main app bundle with TrollStore JIT & high-memory entitlements
+            ldid -S"$TMP_ENT" "$APP"
+            echo "---- Embedded TrollStore Entitlements ----"
+            ldid -e "$APP" || true
+          elif [[ "$CODESIGN_MODE" == "adhoc" ]]; then
+            if [[ -d "$APP/Frameworks" ]]; then
+              find "$APP/Frameworks" -maxdepth 1 \( -name "*.framework" -o -name "*.dylib" \) -exec codesign -f -s - {} +
+            fi
+            if [[ -d "$APP/PlugIns" ]]; then
+              find "$APP/PlugIns" -maxdepth 1 -name "*.appex" -exec codesign -f -s - {} +
+            fi
+            codesign -f -s - --entitlements "$TMP_ENT" "$APP"
+          fi
+
           mkdir -p out/Payload
           cp -R "$APP" out/Payload/
           (cd out && zip -q -r "${IPA_NAME}.ipa" Payload && rm -rf Payload)
@@ -866,7 +955,6 @@ jobs:
           else
             gh release create "$RELEASE_TAG" out/* --repo "$GITHUB_REPOSITORY" \
               --title "$APP_NAME $RELEASE_TAG" \
-              --notes "Unsigned iOS build. Sideload with Sideloadly or AltStore." \
+              --notes "iOS build fake-signed with ldid for TrollStore (iOS 16.5)." \
               --prerelease
           fi
-          
