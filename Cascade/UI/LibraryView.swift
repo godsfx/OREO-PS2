@@ -2,56 +2,67 @@ import SwiftUI
 import UniformTypeIdentifiers
 import UIKit
 
-// MARK: - UIKit Document Picker Wrapper (Fixes iOS 16 .fileImporter "Buka" Freeze)
+// MARK: - Direct UIKit Document Picker Presenter (Bypasses SwiftUI .sheet Modal Conflicts)
 
-private struct DocumentPickerView: UIViewControllerRepresentable {
-    let contentTypes: [UTType]
-    let allowsMultipleSelection: Bool
-    let onPick: ([URL]) -> Void
-    let onCancel: () -> Void
+@MainActor
+private final class DocumentPickerPresenter: NSObject, ObservableObject, UIDocumentPickerDelegate {
+    private var onPick: (([URL]) -> Void)?
+    private var onCancel: (() -> Void)?
 
-    func makeCoordinator() -> Coordinator {
-        Coordinator(onPick: onPick, onCancel: onCancel)
-    }
+    func present(
+        contentTypes: [UTType],
+        allowsMultipleSelection: Bool,
+        onPick: @escaping ([URL]) -> Void,
+        onCancel: @escaping () -> Void
+    ) {
+        guard let topVC = Self.topViewController() else {
+            onCancel()
+            return
+        }
 
-    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
-        // asCopy: true forces iOS FileProvider to copy selected files into app tmp/
-        // and immediately trigger didPickDocumentsAt, preventing iOS 16 / TrollStore
-        // security-scoped bookmark hangs when tapping "Buka".
-        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
+        self.onPick = onPick
+        self.onCancel = onCancel
+
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: false)
         picker.allowsMultipleSelection = allowsMultipleSelection
         picker.shouldShowFileExtensions = true
-        picker.delegate = context.coordinator
-        return picker
+        picker.delegate = self
+
+        topVC.present(picker, animated: true)
     }
 
-    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {
-        context.coordinator.onPick = onPick
-        context.coordinator.onCancel = onCancel
+    func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+        let pickHandler = onPick
+        onPick = nil
+        onCancel = nil
+
+        controller.dismiss(animated: true) {
+            pickHandler?(urls)
+        }
     }
 
-    final class Coordinator: NSObject, UIDocumentPickerDelegate {
-        var onPick: ([URL]) -> Void
-        var onCancel: () -> Void
+    func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+        let cancelHandler = onCancel
+        onPick = nil
+        onCancel = nil
 
-        init(onPick: @escaping ([URL]) -> Void, onCancel: @escaping () -> Void) {
-            self.onPick = onPick
-            self.onCancel = onCancel
+        controller.dismiss(animated: true) {
+            cancelHandler?()
         }
+    }
 
-        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
-            controller.dismiss(animated: true)
-            DispatchQueue.main.async {
-                self.onPick(urls)
-            }
-        }
+    private static func topViewController() -> UIViewController? {
+        let scenes = UIApplication.shared.connectedScenes
+            .compactMap { $0 as? UIWindowScene }
+        let keyWindow = scenes
+            .flatMap { $0.windows }
+            .first(where: { $0.isKeyWindow }) ?? scenes.first?.windows.first
 
-        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
-            controller.dismiss(animated: true)
-            DispatchQueue.main.async {
-                self.onCancel()
-            }
+        var current = keyWindow?.rootViewController
+        while let presented = current?.presentedViewController {
+            current = presented
         }
+        return current
     }
 }
 
@@ -61,14 +72,10 @@ struct LibraryView: View {
     @EnvironmentObject var library: GameLibraryManager
     @EnvironmentObject var emulatorState: EmulatorState
 
-    private enum ActivePicker: String, Identifiable {
-        case game
-        case bios
-        var id: String { rawValue }
-    }
+    @StateObject private var pickerPresenter = DocumentPickerPresenter()
 
-    @State private var activePicker: ActivePicker?
     @State private var isImportingBIOS   = false
+    @State private var biosStatusTitle   = "BIOS Import"
     @State private var biosStatusAlert: String?
     @State private var showNoBIOSAlert   = false
     @State private var showNewCollection = false
@@ -125,7 +132,7 @@ struct LibraryView: View {
             } message: {
                 Text(library.importError ?? "")
             }
-            .alert("BIOS Import", isPresented: Binding(
+            .alert(biosStatusTitle, isPresented: Binding(
                 get: { biosStatusAlert != nil },
                 set: { if !$0 { biosStatusAlert = nil } }
             )) {
@@ -136,10 +143,10 @@ struct LibraryView: View {
             .alert("No BIOS Detected", isPresented: $showNoBIOSAlert) {
                 Button("Import BIOS") {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
-                    presentImporter(.bios, afterAlertDismissal: true)
+                    openBIOSPicker(afterAlertDismissal: true)
                 }
                 Button("Add Game Anyway", role: .none) {
-                    presentImporter(.game, afterAlertDismissal: true)
+                    openGamePicker(afterAlertDismissal: true)
                 }
                 Button("Cancel", role: .cancel) {}
             } message: {
@@ -159,29 +166,49 @@ struct LibraryView: View {
                 Button("Cancel", role: .cancel) { newCollectionName = "" }
             }
         }
-        .sheet(item: $activePicker) { picker in
-            DocumentPickerView(
-                contentTypes: [.item],
+    }
+
+    // MARK: - Present Pickers Directly via UIKit
+
+    private func openGamePicker(afterAlertDismissal: Bool = false) {
+        let launch = {
+            pickerPresenter.present(
+                contentTypes: [.item, .data],
                 allowsMultipleSelection: true
             ) { urls in
-                activePicker = nil
                 guard !urls.isEmpty else { return }
-                switch picker {
-                case .game:
-                    for url in urls {
-                        library.importGame(from: url)
-                    }
-                case .bios:
-                    handleBIOSSelection(urls)
+                for url in urls {
+                    library.importGame(from: url)
                 }
-            } onCancel: {
-                activePicker = nil
-            }
-            .ignoresSafeArea()
+            } onCancel: {}
+        }
+
+        if afterAlertDismissal {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: launch)
+        } else {
+            launch()
         }
     }
 
-    // MARK: - BIOS Import Handler (tmp Inbox -> Local Sandbox)
+    private func openBIOSPicker(afterAlertDismissal: Bool = false) {
+        let launch = {
+            pickerPresenter.present(
+                contentTypes: [.item, .data],
+                allowsMultipleSelection: true
+            ) { urls in
+                guard !urls.isEmpty else { return }
+                handleBIOSSelection(urls)
+            } onCancel: {}
+        }
+
+        if afterAlertDismissal {
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35, execute: launch)
+        } else {
+            launch()
+        }
+    }
+
+    // MARK: - BIOS Import Handler
 
     private func handleBIOSSelection(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
@@ -204,47 +231,52 @@ struct LibraryView: View {
                 let biosDir = supportDir.appendingPathComponent("bios", isDirectory: true)
                 try fm.createDirectory(at: biosDir, withIntermediateDirectories: true)
 
-                var localBinURL: URL?
+                var copiedFiles: [(url: URL, size: Int64)] = []
 
                 for item in scopedURLs {
                     let srcURL = item.url
                     let destURL = biosDir.appendingPathComponent(srcURL.lastPathComponent)
-                    try Self.transferFile(from: srcURL, to: destURL)
-
-                    if srcURL.pathExtension.lowercased() == "bin" {
-                        localBinURL = destURL
-                    }
+                    try Self.coordinatedCopy(from: srcURL, to: destURL)
+                    let attrs = try? fm.attributesOfItem(atPath: destURL.path)
+                    let size = (attrs?[.size] as? NSNumber)?.int64Value ?? 0
+                    copiedFiles.append((destURL, size))
                 }
 
-                let targetURL = localBinURL ?? biosDir.appendingPathComponent(scopedURLs[0].url.lastPathComponent)
+                // Prefer the 4 MB .bin BIOS image if multiple BIOS files (.bin, .nvm, .mec, .rom1) were selected
+                let mainBIOS = copiedFiles.first(where: {
+                    $0.url.pathExtension.lowercased() == "bin" && $0.size >= 1_000_000
+                }) ?? copiedFiles.first(where: {
+                    $0.url.pathExtension.lowercased() == "bin"
+                }) ?? copiedFiles.max(by: { $0.size < $1.size }) ?? copiedFiles[0]
 
                 await MainActor.run {
-                    emulatorState.importBIOS(from: targetURL)
+                    emulatorState.importBIOS(from: mainBIOS.url)
                     isImportingBIOS = false
-                    if !emulatorState.biosLoaded {
-                        biosStatusAlert = "File BIOS (\(targetURL.lastPathComponent)) berhasil disalin ke sandbox, tetapi ditolak oleh core emulator. Pastikan memilih file .BIN utama berukuran 4 MB (contoh: SCPH-70004_BIOS_V12_PAL_200.BIN)."
+
+                    if emulatorState.biosLoaded {
+                        biosStatusTitle = "BIOS Loaded"
+                        biosStatusAlert = "Berhasil memuat BIOS: \(mainBIOS.url.lastPathComponent)"
+                    } else {
+                        let sizeKB = mainBIOS.size / 1024
+                        biosStatusTitle = "BIOS Ditolak"
+                        biosStatusAlert = "File \(mainBIOS.url.lastPathComponent) (\(sizeKB) KB) berhasil disalin ke sandbox, tetapi ditolak oleh EmulatorState. Pastikan memilih file BIOS PS2 utama berukuran 4096 KB (4 MB)."
                     }
                 }
             } catch {
                 let msg = error.localizedDescription
                 await MainActor.run {
                     isImportingBIOS = false
-                    biosStatusAlert = "Gagal menyalin file BIOS: \(msg)"
+                    biosStatusTitle = "BIOS Import Gagal"
+                    biosStatusAlert = "Gagal membaca/menyalin file BIOS: \(msg)"
                 }
             }
         }
     }
 
-    private nonisolated static func transferFile(from srcURL: URL, to destURL: URL) throws {
+    private nonisolated static func coordinatedCopy(from srcURL: URL, to destURL: URL) throws {
         let fm = FileManager.default
         if fm.fileExists(atPath: destURL.path) {
             try fm.removeItem(at: destURL)
-        }
-
-        // Files delivered by UIDocumentPickerViewController(asCopy: true) reside in tmp/
-        if srcURL.path.hasPrefix(fm.temporaryDirectory.path) {
-            try fm.moveItem(at: srcURL, to: destURL)
-            return
         }
 
         var coordinatorError: NSError?
@@ -263,24 +295,12 @@ struct LibraryView: View {
         if let copyError { throw copyError }
     }
 
-    // MARK: - File Importer Presentation
-
-    private func presentImporter(_ mode: ActivePicker, afterAlertDismissal: Bool = false) {
-        if afterAlertDismissal {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
-                activePicker = mode
-            }
-        } else {
-            activePicker = mode
-        }
-    }
-
     // MARK: - Add Game Action (BIOS-gated)
 
     private func requestGameImport() {
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         if emulatorState.biosLoaded {
-            presentImporter(.game)
+            openGamePicker()
         } else {
             showNoBIOSAlert = true
         }
@@ -533,7 +553,7 @@ struct LibraryView: View {
                         .shadow(color: Color.cascadeBlue.opacity(0.35), radius: 8, y: 4)
                 }
                 if !emulatorState.biosLoaded {
-                    Button(action: { presentImporter(.bios) }) {
+                    Button(action: { openBIOSPicker() }) {
                         Label("Import BIOS", systemImage: "cpu")
                             .font(.subheadline)
                             .frame(maxWidth: 220)
@@ -593,7 +613,7 @@ struct LibraryView: View {
     // MARK: - Toolbar Items
 
     private var biosWarningButton: some View {
-        Button(action: { presentImporter(.bios) }) {
+        Button(action: { openBIOSPicker() }) {
             HStack(spacing: 4) {
                 Image(systemName: "exclamationmark.triangle.fill")
                 Text("BIOS")
@@ -621,7 +641,7 @@ struct LibraryView: View {
                         if library.formatFilter == nil { Image(systemName: "checkmark") }
                     }
                 }
-                ForEach(["iso", "bin", "chd"], id: \.self) { fmt in
+                ForEach(["iso", "cue", "bin", "chd"], id: \.self) { fmt in
                     let available = library.availableFormats.contains(fmt)
                     Button(action: {
                         library.formatFilter = library.formatFilter == fmt ? nil : fmt
