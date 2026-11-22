@@ -81,6 +81,10 @@ final class DocumentPickerPresenter: NSObject, ObservableObject, UIDocumentPicke
 // MARK: - LibraryView
 
 struct LibraryView: View {
+    init() {
+        _ = UserDefaultsSafeGuard.install
+    }
+
     @EnvironmentObject var emulatorState: EmulatorState
     @EnvironmentObject var libraryManager: GameLibraryManager
     @Environment(\.scenePhase) private var scenePhase
