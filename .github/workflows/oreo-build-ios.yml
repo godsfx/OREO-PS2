@@ -840,7 +840,7 @@ jobs:
           xcodebuild "${args[@]}" 2>&1 | tee build/xcodebuild.log
 
       - name: Show build errors
-        if: ${ failure() }
+        if: ${{ failure() }}
         run: |
           echo "---- first errors from the build log ----"
           grep -n "error:" build/xcodebuild.log | head -40 || true
