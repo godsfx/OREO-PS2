@@ -246,13 +246,33 @@ public final class GameLibraryManager: ObservableObject {
         }
     }
 
+    // MARK: - Coordinated Copy Helper
+
+    private nonisolated static func coordinatedCopy(from srcURL: URL, to destURL: URL) throws {
+        let fm = FileManager.default
+        guard !fm.fileExists(atPath: destURL.path) else { return }
+
+        var coordinatorError: NSError?
+        var copyError: Error?
+
+        let coordinator = NSFileCoordinator()
+        coordinator.coordinate(readingItemAt: srcURL, options: .withoutChanges, error: &coordinatorError) { coordinatedURL in
+            do {
+                try fm.copyItem(at: coordinatedURL, to: destURL)
+            } catch {
+                copyError = error
+            }
+        }
+
+        if let coordinatorError { throw coordinatorError }
+        if let copyError { throw copyError }
+    }
+
     // MARK: - Static Copy Helpers (nonisolated — run off main actor)
 
     private nonisolated static func copyISO(from url: URL, to gamesDir: URL) throws -> GameEntry {
         let dest = gamesDir.appendingPathComponent(url.lastPathComponent)
-        if !FileManager.default.fileExists(atPath: dest.path) {
-            try FileManager.default.copyItem(at: url, to: dest)
-        }
+        try coordinatedCopy(from: url, to: dest)
         let cdvd = CDVD()
         try? cdvd.loadISO(url: dest)
         var entry = GameEntry(url: dest, cdvd: cdvd)
@@ -268,7 +288,12 @@ public final class GameLibraryManager: ObservableObject {
         to gamesDir: URL,
         companionURLs: [URL] = []
     ) throws -> (entry: GameEntry, consumedBinNames: Set<String>) {
-        let cueText = (try? String(contentsOf: cueURL, encoding: .utf8)) ?? ""
+        var cueText = ""
+        var coordErr: NSError?
+        NSFileCoordinator().coordinate(readingItemAt: cueURL, options: .withoutChanges, error: &coordErr) { coordinatedURL in
+            cueText = (try? String(contentsOf: coordinatedURL, encoding: .utf8)) ?? ""
+        }
+
         var binNames: [String] = []
         for line in cueText.components(separatedBy: .newlines) {
             let t = line.trimmingCharacters(in: .whitespaces)
@@ -281,9 +306,7 @@ public final class GameLibraryManager: ObservableObject {
         }
 
         let cueDest = gamesDir.appendingPathComponent(cueURL.lastPathComponent)
-        if !FileManager.default.fileExists(atPath: cueDest.path) {
-            try FileManager.default.copyItem(at: cueURL, to: cueDest)
-        }
+        try coordinatedCopy(from: cueURL, to: cueDest)
 
         var consumedBinNames = Set<String>()
         for binName in binNames {
@@ -295,12 +318,12 @@ public final class GameLibraryManager: ObservableObject {
 
             // Prefer security-scoped URL picked alongside the .cue, fallback to sibling URL in same folder
             if let pickedBin = companionURLs.first(where: { $0.lastPathComponent.lowercased() == binName.lowercased() }) {
-                try FileManager.default.copyItem(at: pickedBin, to: binDest)
+                try coordinatedCopy(from: pickedBin, to: binDest)
                 consumedBinNames.insert(binName.lowercased())
             } else {
                 let binSrc = cueURL.deletingLastPathComponent().appendingPathComponent(binName)
                 if FileManager.default.fileExists(atPath: binSrc.path) {
-                    try FileManager.default.copyItem(at: binSrc, to: binDest)
+                    try coordinatedCopy(from: binSrc, to: binDest)
                     consumedBinNames.insert(binName.lowercased())
                 }
             }
