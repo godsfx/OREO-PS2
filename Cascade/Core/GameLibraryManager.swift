@@ -157,7 +157,7 @@ public final class GameLibraryManager: ObservableObject {
         try? JSONEncoder().encode(collections).write(to: collectionsURL)
     }
 
-    // MARK: - Import Games (async — file move/copy runs on a background thread)
+    // MARK: - Import Games (async — file copy runs on a background thread)
 
     func importGame(from url: URL) {
         let accessed = url.startAccessingSecurityScopedResource()
@@ -216,7 +216,7 @@ public final class GameLibraryManager: ObservableObject {
                 await MainActor.run { [weak self] in
                     guard let self else { return }
 
-                    // Release and remove any companion .bin items already moved/copied as part of this .cue
+                    // Release and remove any companion .bin items already copied as part of this .cue
                     if !consumedBinNames.isEmpty {
                         self.pendingImports.removeAll { item in
                             if consumedBinNames.contains(item.url.lastPathComponent.lowercased()) {
@@ -229,10 +229,12 @@ public final class GameLibraryManager: ObservableObject {
                         }
                     }
 
-                    if !self.games.contains(where: { $0.id == entry.id }) {
+                    if let existingIndex = self.games.firstIndex(where: { $0.id == entry.id }) {
+                        self.games[existingIndex] = entry
+                    } else {
                         self.games.append(entry)
-                        self.save()
                     }
+                    self.save()
                     self.processNextImport()
                 }
             } catch {
@@ -246,21 +248,12 @@ public final class GameLibraryManager: ObservableObject {
         }
     }
 
-    // MARK: - Transfer Helper (Moves tmp/ Inbox files instantaneously, coordinates external URLs)
+    // MARK: - Coordinated Copy Helper
 
-    private nonisolated static func transferFile(from srcURL: URL, to destURL: URL) throws {
+    private nonisolated static func coordinatedCopy(from srcURL: URL, to destURL: URL) throws {
         let fm = FileManager.default
-        guard !fm.fileExists(atPath: destURL.path) else {
-            if srcURL.path.hasPrefix(fm.temporaryDirectory.path) {
-                try? fm.removeItem(at: srcURL)
-            }
-            return
-        }
-
-        // Files delivered by UIDocumentPickerViewController(asCopy: true) reside in tmp/
-        if srcURL.path.hasPrefix(fm.temporaryDirectory.path) {
-            try fm.moveItem(at: srcURL, to: destURL)
-            return
+        if fm.fileExists(atPath: destURL.path) {
+            try fm.removeItem(at: destURL)
         }
 
         var coordinatorError: NSError?
@@ -283,7 +276,7 @@ public final class GameLibraryManager: ObservableObject {
 
     private nonisolated static func copyISO(from url: URL, to gamesDir: URL) throws -> GameEntry {
         let dest = gamesDir.appendingPathComponent(url.lastPathComponent)
-        try transferFile(from: url, to: dest)
+        try coordinatedCopy(from: url, to: dest)
         let cdvd = CDVD()
         try? cdvd.loadISO(url: dest)
         var entry = GameEntry(url: dest, cdvd: cdvd)
@@ -299,7 +292,12 @@ public final class GameLibraryManager: ObservableObject {
         to gamesDir: URL,
         companionURLs: [URL] = []
     ) throws -> (entry: GameEntry, consumedBinNames: Set<String>) {
-        let cueText = (try? String(contentsOf: cueURL, encoding: .utf8)) ?? ""
+        var cueText = ""
+        var coordErr: NSError?
+        NSFileCoordinator().coordinate(readingItemAt: cueURL, options: .withoutChanges, error: &coordErr) { coordinatedURL in
+            cueText = (try? String(contentsOf: coordinatedURL, encoding: .utf8)) ?? ""
+        }
+
         var binNames: [String] = []
         for line in cueText.components(separatedBy: .newlines) {
             let t = line.trimmingCharacters(in: .whitespaces)
@@ -312,23 +310,19 @@ public final class GameLibraryManager: ObservableObject {
         }
 
         let cueDest = gamesDir.appendingPathComponent(cueURL.lastPathComponent)
-        try transferFile(from: cueURL, to: cueDest)
+        try coordinatedCopy(from: cueURL, to: cueDest)
 
         var consumedBinNames = Set<String>()
         for binName in binNames {
             let binDest = gamesDir.appendingPathComponent(binName)
-            guard !FileManager.default.fileExists(atPath: binDest.path) else {
-                consumedBinNames.insert(binName.lowercased())
-                continue
-            }
 
             if let pickedBin = companionURLs.first(where: { $0.lastPathComponent.lowercased() == binName.lowercased() }) {
-                try transferFile(from: pickedBin, to: binDest)
+                try coordinatedCopy(from: pickedBin, to: binDest)
                 consumedBinNames.insert(binName.lowercased())
             } else {
                 let binSrc = cueURL.deletingLastPathComponent().appendingPathComponent(binName)
                 if FileManager.default.fileExists(atPath: binSrc.path) {
-                    try transferFile(from: binSrc, to: binDest)
+                    try coordinatedCopy(from: binSrc, to: binDest)
                     consumedBinNames.insert(binName.lowercased())
                 }
             }
