@@ -1,17 +1,73 @@
 import SwiftUI
 import UniformTypeIdentifiers
+import UIKit
+
+// MARK: - UIKit Document Picker Wrapper (Fixes iOS 16 .fileImporter "Buka" Freeze)
+
+private struct DocumentPickerView: UIViewControllerRepresentable {
+    let contentTypes: [UTType]
+    let allowsMultipleSelection: Bool
+    let onPick: ([URL]) -> Void
+    let onCancel: () -> Void
+
+    func makeCoordinator() -> Coordinator {
+        Coordinator(onPick: onPick, onCancel: onCancel)
+    }
+
+    func makeUIViewController(context: Context) -> UIDocumentPickerViewController {
+        // asCopy: true forces iOS FileProvider to copy selected files into app tmp/
+        // and immediately trigger didPickDocumentsAt, preventing iOS 16 / TrollStore
+        // security-scoped bookmark hangs when tapping "Buka".
+        let picker = UIDocumentPickerViewController(forOpeningContentTypes: contentTypes, asCopy: true)
+        picker.allowsMultipleSelection = allowsMultipleSelection
+        picker.shouldShowFileExtensions = true
+        picker.delegate = context.coordinator
+        return picker
+    }
+
+    func updateUIViewController(_ uiViewController: UIDocumentPickerViewController, context: Context) {
+        context.coordinator.onPick = onPick
+        context.coordinator.onCancel = onCancel
+    }
+
+    final class Coordinator: NSObject, UIDocumentPickerDelegate {
+        var onPick: ([URL]) -> Void
+        var onCancel: () -> Void
+
+        init(onPick: @escaping ([URL]) -> Void, onCancel: @escaping () -> Void) {
+            self.onPick = onPick
+            self.onCancel = onCancel
+        }
+
+        func documentPicker(_ controller: UIDocumentPickerViewController, didPickDocumentsAt urls: [URL]) {
+            controller.dismiss(animated: true)
+            DispatchQueue.main.async {
+                self.onPick(urls)
+            }
+        }
+
+        func documentPickerWasCancelled(_ controller: UIDocumentPickerViewController) {
+            controller.dismiss(animated: true)
+            DispatchQueue.main.async {
+                self.onCancel()
+            }
+        }
+    }
+}
+
+// MARK: - Library View
 
 struct LibraryView: View {
     @EnvironmentObject var library: GameLibraryManager
     @EnvironmentObject var emulatorState: EmulatorState
 
-    private enum ImportMode {
+    private enum ActivePicker: String, Identifiable {
         case game
         case bios
+        var id: String { rawValue }
     }
 
-    @State private var showFileImporter  = false
-    @State private var importMode: ImportMode = .game
+    @State private var activePicker: ActivePicker?
     @State private var isImportingBIOS   = false
     @State private var biosStatusAlert: String?
     @State private var showNoBIOSAlert   = false
@@ -53,27 +109,6 @@ struct LibraryView: View {
                     addButton
                 }
             }
-            // Single unified file importer to prevent SwiftUI multiple-.fileImporter conflicts
-            .fileImporter(
-                isPresented: $showFileImporter,
-                allowedContentTypes: [.item, .data],
-                allowsMultipleSelection: true
-            ) { result in
-                switch result {
-                case .success(let urls):
-                    guard !urls.isEmpty else { return }
-                    switch importMode {
-                    case .game:
-                        for url in urls {
-                            library.importGame(from: url)
-                        }
-                    case .bios:
-                        handleBIOSSelection(urls)
-                    }
-                case .failure(let error):
-                    library.importError = error.localizedDescription
-                }
-            }
             .overlay(alignment: .bottom) {
                 if library.isImporting || isImportingBIOS {
                     importingBanner(text: isImportingBIOS ? "Importing BIOS…" : "Importing game…")
@@ -98,7 +133,6 @@ struct LibraryView: View {
             } message: {
                 Text(biosStatusAlert ?? "")
             }
-            // No BIOS alert — defer fileImporter presentation until alert finishes dismissing
             .alert("No BIOS Detected", isPresented: $showNoBIOSAlert) {
                 Button("Import BIOS") {
                     UIImpactFeedbackGenerator(style: .medium).impactOccurred()
@@ -125,9 +159,29 @@ struct LibraryView: View {
                 Button("Cancel", role: .cancel) { newCollectionName = "" }
             }
         }
+        .sheet(item: $activePicker) { picker in
+            DocumentPickerView(
+                contentTypes: [.item],
+                allowsMultipleSelection: true
+            ) { urls in
+                activePicker = nil
+                guard !urls.isEmpty else { return }
+                switch picker {
+                case .game:
+                    for url in urls {
+                        library.importGame(from: url)
+                    }
+                case .bios:
+                    handleBIOSSelection(urls)
+                }
+            } onCancel: {
+                activePicker = nil
+            }
+            .ignoresSafeArea()
+        }
     }
 
-    // MARK: - BIOS Import Handler (Security-Scoped -> Local Sandbox)
+    // MARK: - BIOS Import Handler (tmp Inbox -> Local Sandbox)
 
     private func handleBIOSSelection(_ urls: [URL]) {
         guard !urls.isEmpty else { return }
@@ -155,7 +209,7 @@ struct LibraryView: View {
                 for item in scopedURLs {
                     let srcURL = item.url
                     let destURL = biosDir.appendingPathComponent(srcURL.lastPathComponent)
-                    try Self.coordinatedCopy(from: srcURL, to: destURL)
+                    try Self.transferFile(from: srcURL, to: destURL)
 
                     if srcURL.pathExtension.lowercased() == "bin" {
                         localBinURL = destURL
@@ -168,7 +222,7 @@ struct LibraryView: View {
                     emulatorState.importBIOS(from: targetURL)
                     isImportingBIOS = false
                     if !emulatorState.biosLoaded {
-                        biosStatusAlert = "File BIOS (\(targetURL.lastPathComponent)) sudah disalin ke sandbox, tetapi ditolak oleh core emulator. Pastikan memilih file .BIN utama berukuran 4 MB (contoh: SCPH-70004_BIOS_V12_PAL_200.BIN)."
+                        biosStatusAlert = "File BIOS (\(targetURL.lastPathComponent)) berhasil disalin ke sandbox, tetapi ditolak oleh core emulator. Pastikan memilih file .BIN utama berukuran 4 MB (contoh: SCPH-70004_BIOS_V12_PAL_200.BIN)."
                     }
                 }
             } catch {
@@ -181,17 +235,24 @@ struct LibraryView: View {
         }
     }
 
-    private nonisolated static func coordinatedCopy(from srcURL: URL, to destURL: URL) throws {
+    private nonisolated static func transferFile(from srcURL: URL, to destURL: URL) throws {
         let fm = FileManager.default
+        if fm.fileExists(atPath: destURL.path) {
+            try fm.removeItem(at: destURL)
+        }
+
+        // Files delivered by UIDocumentPickerViewController(asCopy: true) reside in tmp/
+        if srcURL.path.hasPrefix(fm.temporaryDirectory.path) {
+            try fm.moveItem(at: srcURL, to: destURL)
+            return
+        }
+
         var coordinatorError: NSError?
         var copyError: Error?
 
         let coordinator = NSFileCoordinator()
         coordinator.coordinate(readingItemAt: srcURL, options: .withoutChanges, error: &coordinatorError) { coordinatedURL in
             do {
-                if fm.fileExists(atPath: destURL.path) {
-                    try fm.removeItem(at: destURL)
-                }
                 try fm.copyItem(at: coordinatedURL, to: destURL)
             } catch {
                 copyError = error
@@ -204,14 +265,13 @@ struct LibraryView: View {
 
     // MARK: - File Importer Presentation
 
-    private func presentImporter(_ mode: ImportMode, afterAlertDismissal: Bool = false) {
-        importMode = mode
+    private func presentImporter(_ mode: ActivePicker, afterAlertDismissal: Bool = false) {
         if afterAlertDismissal {
-            DispatchQueue.main.asyncAfter(deadline: .now() + 0.15) {
-                showFileImporter = true
+            DispatchQueue.main.asyncAfter(deadline: .now() + 0.35) {
+                activePicker = mode
             }
         } else {
-            showFileImporter = true
+            activePicker = mode
         }
     }
 
@@ -241,26 +301,22 @@ struct LibraryView: View {
     private var gameGrid: some View {
         ScrollView {
             VStack(spacing: 0) {
-                // Resume last game banner
                 if let last = lastPlayedGame, emulatorState.status == .idle {
                     resumeBanner(game: last)
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                 }
 
-                // JIT status badge
                 statusBadge
                     .padding(.horizontal, 16)
                     .padding(.top, 8)
 
-                // Active filter summary (shows when filters are on)
                 if library.activeFilterCount > 0 {
                     activeFilterBanner
                         .padding(.horizontal, 16)
                         .padding(.top, 8)
                 }
 
-                // Collections filter chips
                 if !library.collections.isEmpty {
                     collectionsBar.padding(.top, 10)
                 }
@@ -558,7 +614,6 @@ struct LibraryView: View {
 
     private var filterButton: some View {
         Menu {
-            // Format section
             Section("Format") {
                 Button(action: { library.formatFilter = nil }) {
                     HStack {
@@ -581,7 +636,6 @@ struct LibraryView: View {
                 }
             }
 
-            // Region section
             Section("Region") {
                 Button(action: { library.regionFilter = nil }) {
                     HStack {
@@ -692,7 +746,6 @@ struct GameCardView: View {
             }
             VStack {
                 HStack {
-                    // Format badge (top-left)
                     Text(game.url.pathExtension.uppercased())
                         .font(.system(size: 9, weight: .bold, design: .monospaced))
                         .foregroundColor(.white.opacity(0.85))
