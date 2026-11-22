@@ -61,6 +61,13 @@ public final class GameLibraryManager: ObservableObject {
     @Published var isImporting: Bool = false
     @Published var importError: String?
 
+    private struct PendingImport: Sendable {
+        let url: URL
+        let hasSecurityScope: Bool
+    }
+
+    private var pendingImports: [PendingImport] = []
+
     enum SortOrder: String, CaseIterable {
         case title      = "Title"
         case lastPlayed = "Last Played"
@@ -153,45 +160,95 @@ public final class GameLibraryManager: ObservableObject {
     // MARK: - Import Games (async — file copy runs on a background thread)
 
     func importGame(from url: URL) {
-        guard !isImporting else { return }
-        _ = url.startAccessingSecurityScopedResource()
-        isImporting = true
-        importError = nil
+        let accessed = url.startAccessingSecurityScopedResource()
+        pendingImports.append(PendingImport(url: url, hasSecurityScope: accessed))
+        if !isImporting {
+            importError = nil
+            processNextImport()
+        }
+    }
 
-        let destDir  = gamesDir
-        let ext      = url.pathExtension.lowercased()
+    private func processNextImport() {
+        guard !pendingImports.isEmpty else {
+            isImporting = false
+            return
+        }
+
+        // Prioritize .cue files so companion .bin files selected alongside them are consumed together
+        let nextIndex = pendingImports.firstIndex(where: { $0.url.pathExtension.lowercased() == "cue" }) ?? 0
+        let current = pendingImports.remove(at: nextIndex)
+        isImporting = true
+
+        let destDir = gamesDir
+        let ext = current.url.pathExtension.lowercased()
+
+        // Capture any queued .bin files in case the user picked both .cue and .bin together
+        var companionBins: [PendingImport] = []
+        if ext == "cue" {
+            companionBins = pendingImports.filter { $0.url.pathExtension.lowercased() == "bin" }
+        }
 
         Task.detached(priority: .userInitiated) { [weak self] in
-            defer { url.stopAccessingSecurityScopedResource() }
+            defer {
+                if current.hasSecurityScope {
+                    current.url.stopAccessingSecurityScopedResource()
+                }
+            }
+
             do {
                 try FileManager.default.createDirectory(at: destDir, withIntermediateDirectories: true)
                 let entry: GameEntry
+                let consumedBinNames: Set<String>
+
                 if ext == "cue" {
-                    entry = try GameLibraryManager.copyCUE(from: url, to: destDir)
+                    let result = try GameLibraryManager.copyCUE(
+                        from: current.url,
+                        to: destDir,
+                        companionURLs: companionBins.map(\.url)
+                    )
+                    entry = result.entry
+                    consumedBinNames = result.consumedBinNames
                 } else {
-                    entry = try GameLibraryManager.copyISO(from: url, to: destDir)
+                    entry = try GameLibraryManager.copyISO(from: current.url, to: destDir)
+                    consumedBinNames = []
                 }
+
                 await MainActor.run { [weak self] in
                     guard let self else { return }
+
+                    // Release and remove any companion .bin items already copied as part of this .cue
+                    if !consumedBinNames.isEmpty {
+                        self.pendingImports.removeAll { item in
+                            if consumedBinNames.contains(item.url.lastPathComponent.lowercased()) {
+                                if item.hasSecurityScope {
+                                    item.url.stopAccessingSecurityScopedResource()
+                                }
+                                return true
+                            }
+                            return false
+                        }
+                    }
+
                     if !self.games.contains(where: { $0.id == entry.id }) {
                         self.games.append(entry)
                         self.save()
                     }
-                    self.isImporting = false
+                    self.processNextImport()
                 }
             } catch {
                 let msg = error.localizedDescription
                 await MainActor.run { [weak self] in
-                    self?.importError = msg
-                    self?.isImporting = false
+                    guard let self else { return }
+                    self.importError = msg
+                    self.processNextImport()
                 }
             }
         }
     }
 
-    // MARK: - Static Copy Helpers (run off main actor)
+    // MARK: - Static Copy Helpers (nonisolated — run off main actor)
 
-    private static func copyISO(from url: URL, to gamesDir: URL) throws -> GameEntry {
+    private nonisolated static func copyISO(from url: URL, to gamesDir: URL) throws -> GameEntry {
         let dest = gamesDir.appendingPathComponent(url.lastPathComponent)
         if !FileManager.default.fileExists(atPath: dest.path) {
             try FileManager.default.copyItem(at: url, to: dest)
@@ -206,14 +263,20 @@ public final class GameLibraryManager: ObservableObject {
         return entry
     }
 
-    private static func copyCUE(from cueURL: URL, to gamesDir: URL) throws -> GameEntry {
+    private nonisolated static func copyCUE(
+        from cueURL: URL,
+        to gamesDir: URL,
+        companionURLs: [URL] = []
+    ) throws -> (entry: GameEntry, consumedBinNames: Set<String>) {
         let cueText = (try? String(contentsOf: cueURL, encoding: .utf8)) ?? ""
-        var binName: String?
-        for line in cueText.components(separatedBy: "\n") {
+        var binNames: [String] = []
+        for line in cueText.components(separatedBy: .newlines) {
             let t = line.trimmingCharacters(in: .whitespaces)
             if t.uppercased().hasPrefix("FILE") {
                 let parts = t.components(separatedBy: "\"")
-                if parts.count >= 2 { binName = parts[1]; break }
+                if parts.count >= 2, !parts[1].isEmpty {
+                    binNames.append(parts[1])
+                }
             }
         }
 
@@ -222,12 +285,24 @@ public final class GameLibraryManager: ObservableObject {
             try FileManager.default.copyItem(at: cueURL, to: cueDest)
         }
 
-        if let binName {
-            let binSrc  = cueURL.deletingLastPathComponent().appendingPathComponent(binName)
+        var consumedBinNames = Set<String>()
+        for binName in binNames {
             let binDest = gamesDir.appendingPathComponent(binName)
-            if FileManager.default.fileExists(atPath: binSrc.path),
-               !FileManager.default.fileExists(atPath: binDest.path) {
-                try FileManager.default.copyItem(at: binSrc, to: binDest)
+            guard !FileManager.default.fileExists(atPath: binDest.path) else {
+                consumedBinNames.insert(binName.lowercased())
+                continue
+            }
+
+            // Prefer security-scoped URL picked alongside the .cue, fallback to sibling URL in same folder
+            if let pickedBin = companionURLs.first(where: { $0.lastPathComponent.lowercased() == binName.lowercased() }) {
+                try FileManager.default.copyItem(at: pickedBin, to: binDest)
+                consumedBinNames.insert(binName.lowercased())
+            } else {
+                let binSrc = cueURL.deletingLastPathComponent().appendingPathComponent(binName)
+                if FileManager.default.fileExists(atPath: binSrc.path) {
+                    try FileManager.default.copyItem(at: binSrc, to: binDest)
+                    consumedBinNames.insert(binName.lowercased())
+                }
             }
         }
 
@@ -238,7 +313,7 @@ public final class GameLibraryManager: ObservableObject {
             entry.id    = cdvd.discID
             entry.title = titleLookup[cdvd.discID.uppercased()] ?? entry.title
         }
-        return entry
+        return (entry, consumedBinNames)
     }
 
     // MARK: - Game Mutations
@@ -301,7 +376,7 @@ public final class GameLibraryManager: ObservableObject {
 
     // MARK: - Title Lookup
 
-    private static let titleLookup: [String: String] = [
+    private nonisolated static let titleLookup: [String: String] = [
         "SLUS-20062": "Grand Theft Auto III",
         "SLUS-20415": "Grand Theft Auto: San Andreas",
         "SLUS-20184": "Grand Theft Auto: Vice City",
