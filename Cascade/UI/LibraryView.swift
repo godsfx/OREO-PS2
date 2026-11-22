@@ -311,7 +311,7 @@ struct LibraryView: View {
 
                 Spacer()
 
-                Text("\(emulatorState.executionMode) • \(emulatorState.jitBlockCount) blocks")
+                Text("\(String(describing: emulatorState.executionMode)) • \(emulatorState.jitBlockCount) blocks")
                     .font(.caption.monospaced())
                     .foregroundStyle(Color.white.opacity(0.75))
                     .padding(.horizontal, 8)
