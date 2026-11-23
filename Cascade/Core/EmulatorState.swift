@@ -201,6 +201,11 @@ public final class EmulatorState: ObservableObject {
     // MARK: - Game Launch
 
     func launch(game: GameEntry) {
+        let logURL = BootDiagLogger.shared.startSession(gameTitle: game.title, discURL: game.url)
+        BootDiagLogger.shared.log("LAUNCH", "Starting game id=\(game.id) ext=\(game.url.pathExtension) mode=\(executionMode.rawValue)")
+        if let logURL {
+            BootDiagLogger.shared.log("LAUNCH", "Temporary log saved at: \(logURL.path)")
+        }
         status = .loading
         frameGate.withLock {
             frameCount = 0
@@ -212,16 +217,23 @@ public final class EmulatorState: ObservableObject {
             do {
                 if let burl = biosURL {
                     let bdata = try Data(contentsOf: burl)
+                    BootDiagLogger.shared.log("BIOS", "Loaded BIOS from \(burl.lastPathComponent) size=\(bdata.count) bytes")
                     try emulator.loadBIOS(data: bdata)
+                } else {
+                    BootDiagLogger.shared.log("BIOS", "WARNING: biosURL is nil")
                 }
                 try emulator.loadDisc(url: game.url)
+                BootDiagLogger.shared.log("DISC", "Disc loaded OK | discID=\(emulator.cdvd.discID) region=\(emulator.cdvd.discRegion.rawValue)")
                 currentGame = game
                 lastPlayedGame = game
                 UserDefaults.standard.set(game.id, forKey: "lastPlayedGameID")
                 status = .running
                 startFPSCounter()
                 emulator.start()
+                BootDiagLogger.shared.log("LAUNCH", "Emulator thread started")
             } catch {
+                BootDiagLogger.shared.log("ERROR", "Launch failed: \(error.localizedDescription)")
+                BootDiagLogger.shared.flush()
                 status = .idle
                 errorMessage = error.localizedDescription
                 showError = true
@@ -246,6 +258,8 @@ public final class EmulatorState: ObservableObject {
     }
 
     func stop() {
+        BootDiagLogger.shared.log("LAUNCH", "Stop requested | finalFPS=\(fps) jitBlocks=\(jitBlockCount)")
+        BootDiagLogger.shared.close()
         emulator.stop()
         status = .idle
         currentGame = nil

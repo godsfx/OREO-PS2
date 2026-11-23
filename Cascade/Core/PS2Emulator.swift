@@ -260,14 +260,14 @@ public final class PS2Emulator: @unchecked Sendable {
             ee.checkAndDeliverInterrupt(intcPending: true)
         }
 
-        // Only copy and emit a new framebuffer when VRAM/BGCOLOR actually changed
-        // (or on the very first frame so UI dismisses the loading spinner).
+        // Always emit heartbeat/frame callback so EMU FPS reflects loop speed even before GS draws
         let currentGen = gs.frameGeneration
         if currentGen != lastPresentedGSGeneration {
             lastPresentedGSGeneration = currentGen
-            let frame = gs.getFrameBuffer()
-            onFrameReady?(frame, gs.outputWidth, gs.outputHeight)
+            BootDiagLogger.shared.log("GS", "Frame generation updated -> \(currentGen) (\(gs.outputWidth)x\(gs.outputHeight)) bgcolor=0x\(String(gs.bgcolor, radix: 16))")
         }
+        let frame = gs.getFrameBuffer()
+        onFrameReady?(frame, gs.outputWidth, gs.outputHeight)
     }
 
     private func applyActiveCheatsToRAM() {
@@ -300,6 +300,7 @@ public final class PS2Emulator: @unchecked Sendable {
 
     private var lastJITBlockSnapshot: Int = -1
     private var stallTickCount: Int = 0
+    private var totalSlicesExecuted: Int = 0
 
     private func executeSliceJIT(cycles: Int) {
         var remaining = cycles
@@ -321,16 +322,44 @@ public final class PS2Emulator: @unchecked Sendable {
             }
         }
 
+        totalSlicesExecuted += 1
         let currentBlocks = jitCache.blockCount
         if currentBlocks == lastJITBlockSnapshot {
             stallTickCount += 1
-            if stallTickCount == 960 {
-                print("[Cascade][JIT] Stalled at \(currentBlocks) blocks | EE PC=0x\(String(ee.pc, radix: 16)) | IOP PC=0x\(String(iop.pc, radix: 16)) | INTC stat=0x\(String(intc.stat, radix: 16)) mask=0x\(String(intc.mask, radix: 16))")
+            if stallTickCount == 160 || stallTickCount == 960 || stallTickCount % 3200 == 0 {
+                dumpStallSnapshot(blocks: currentBlocks)
             }
         } else {
+            if currentBlocks <= 64 || currentBlocks % 50 == 0 {
+                BootDiagLogger.shared.log("JIT", "Block #\(currentBlocks) compiled at EE PC=0x\(String(ee.pc, radix: 16, uppercase: true)) | IOP PC=0x\(String(iop.pc, radix: 16, uppercase: true))")
+            }
             lastJITBlockSnapshot = currentBlocks
             stallTickCount = 0
         }
+    }
+
+    private func dumpStallSnapshot(blocks: Int) {
+        var words: [String] = []
+        let basePC = ee.pc &- 16
+        for i in 0..<12 {
+            let addr = basePC &+ UInt32(i * 4)
+            let op = bus.read32(address: addr)
+            words.append(String(format: "0x%08X:%08X", addr, op))
+        }
+        var iopWords: [String] = []
+        let iopBase = iop.pc &- 8
+        for i in 0..<6 {
+            let addr = iopBase &+ UInt32(i * 4)
+            let op = iop.read32(address: addr)
+            iopWords.append(String(format: "0x%08X:%08X", addr, op))
+        }
+        BootDiagLogger.shared.log(
+            "STALL",
+            "blocks=\(blocks) slices=\(totalSlicesExecuted) | EE_PC=0x\(String(ee.pc, radix: 16, uppercase: true)) COP0_SR=0x\(String(ee.cop0.status, radix: 16, uppercase: true)) | IOP_PC=0x\(String(iop.pc, radix: 16, uppercase: true)) IOP_ISTAT=0x\(String(iop.iStat, radix: 16, uppercase: true)) IOP_IMASK=0x\(String(iop.iMask, radix: 16, uppercase: true)) | INTC_STAT=0x\(String(intc.stat, radix: 16, uppercase: true)) INTC_MASK=0x\(String(intc.mask, radix: 16, uppercase: true)) | SIF_MSCOM=0x\(String(bus.sifMscom, radix: 16, uppercase: true)) SIF_SMCOM=0x\(String(bus.sifSmcom, radix: 16, uppercase: true)) SIF_SMFLAG=0x\(String(bus.sifSmflag, radix: 16, uppercase: true))"
+        )
+        BootDiagLogger.shared.log("STALL-EE-CODE", words.joined(separator: " "))
+        BootDiagLogger.shared.log("STALL-IOP-CODE", iopWords.joined(separator: " "))
+        BootDiagLogger.shared.flush()
     }
 
     // MARK: - VBlank
