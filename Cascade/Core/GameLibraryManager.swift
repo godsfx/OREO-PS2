@@ -1,5 +1,6 @@
 import Foundation
 import SwiftUI
+import UIKit
 import UniformTypeIdentifiers
 
 // MARK: - GameEntry
@@ -51,6 +52,8 @@ struct GameEntry: Identifiable, Codable, Hashable, Sendable {
             return "PAL"
         case "NTSC-J", "JPN", "JP":
             return "NTSC-J"
+        case "NTSC-K", "KOR", "KR":
+            return "NTSC-K"
         default:
             return region.isEmpty ? "PS2" : region
         }
@@ -108,7 +111,7 @@ struct GameEntry: Identifiable, Codable, Hashable, Sendable {
             .replacingOccurrences(of: "_", with: " ")
             .trimmingCharacters(in: .whitespacesAndNewlines)
         let resolvedTitle = GameLibraryManager.titleLookup[extractedID] ?? (cleanStem.isEmpty ? "PlayStation 2 Disc" : cleanStem)
-        let size = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
+        let size = GameLibraryManager.computeDiscTotalSize(at: url)
 
         self.init(
             title: resolvedTitle,
@@ -153,10 +156,7 @@ struct GameCollection: Identifiable, Codable, Hashable, Sendable {
         Self.palette[abs(colorIndex) % Self.palette.count]
     }
 
-    /// Alias compatibility for views expecting `collection.color`
     var color: Color { accentColor }
-
-    /// Default SF Symbol aliases for views expecting collection icons
     var icon: String { "folder.fill" }
     var systemImage: String { "folder.fill" }
 }
@@ -180,6 +180,191 @@ enum GameImportError: LocalizedError, Sendable {
         case .copyFailed(let reason):
             return "Gagal menyalin file ke library: \(reason)"
         }
+    }
+}
+
+// MARK: - GameCoverCache (Automatic Box-Art Downloader + Disk/Memory Cache)
+
+@MainActor
+final class GameCoverCache: ObservableObject {
+    static let shared = GameCoverCache()
+
+    @Published private(set) var revision: Int = 0
+
+    private let memoryCache = NSCache<NSString, UIImage>()
+    private var inFlightKeys: Set<String> = []
+    private var failedKeys: Set<String> = []
+
+    nonisolated static var coversDirectoryURL: URL {
+        GameLibraryManager.appSupportDirectoryURL.appendingPathComponent("Covers", isDirectory: true)
+    }
+
+    private init() {
+        memoryCache.countLimit = 120
+        try? FileManager.default.createDirectory(at: Self.coversDirectoryURL, withIntermediateDirectories: true)
+    }
+
+    func coverImage(for game: GameEntry) -> UIImage? {
+        let customKey = "custom_\(game.id.uuidString)" as NSString
+        if let cached = memoryCache.object(forKey: customKey) {
+            return cached
+        }
+        let customURL = Self.customCoverURL(for: game.id)
+        if let img = UIImage(contentsOfFile: customURL.path) {
+            memoryCache.setObject(img, forKey: customKey)
+            return img
+        }
+
+        // Check sidecar image placed in Documents/games (e.g. GameTitle.jpg / SLUS-20062.png)
+        let sidecarKey = "sidecar_\(game.fileName.lowercased())" as NSString
+        if let cachedSidecar = memoryCache.object(forKey: sidecarKey) {
+            return cachedSidecar
+        }
+        if let sidecarURL = Self.findSidecarCoverURL(for: game),
+           let sidecarImg = UIImage(contentsOfFile: sidecarURL.path) {
+            memoryCache.setObject(sidecarImg, forKey: sidecarKey)
+            return sidecarImg
+        }
+
+        let serial = Self.normalizedSerial(game.discID)
+        guard !serial.isEmpty else { return nil }
+
+        let serialKey = serial as NSString
+        if let cached = memoryCache.object(forKey: serialKey) {
+            return cached
+        }
+
+        let diskURL = Self.serialCoverURL(for: serial)
+        if let diskImg = UIImage(contentsOfFile: diskURL.path) {
+            memoryCache.setObject(diskImg, forKey: serialKey)
+            return diskImg
+        }
+
+        return nil
+    }
+
+    func hasCustomCover(for game: GameEntry) -> Bool {
+        FileManager.default.fileExists(atPath: Self.customCoverURL(for: game.id).path)
+    }
+
+    func setCustomCover(_ image: UIImage, for game: GameEntry) {
+        try? FileManager.default.createDirectory(at: Self.coversDirectoryURL, withIntermediateDirectories: true)
+        let resized = Self.downscaleImage(image, maxDimension: 600)
+        if let jpegData = resized.jpegData(compressionQuality: 0.86) {
+            let dest = Self.customCoverURL(for: game.id)
+            try? jpegData.write(to: dest, options: .atomic)
+            memoryCache.setObject(resized, forKey: "custom_\(game.id.uuidString)" as NSString)
+            revision &+= 1
+        }
+    }
+
+    func removeCustomCover(for game: GameEntry) {
+        let dest = Self.customCoverURL(for: game.id)
+        try? FileManager.default.removeItem(at: dest)
+        memoryCache.removeObject(forKey: "custom_\(game.id.uuidString)" as NSString)
+        revision &+= 1
+    }
+
+    func fetchCoverIfNeeded(for game: GameEntry) {
+        if coverImage(for: game) != nil { return }
+        let serial = Self.normalizedSerial(game.discID)
+        guard !serial.isEmpty else { return }
+        guard !inFlightKeys.contains(serial), !failedKeys.contains(serial) else { return }
+
+        inFlightKeys.insert(serial)
+
+        Task { [weak self] in
+            let fetched = await Self.downloadCoverFromRepositories(serial: serial)
+            guard let self else { return }
+            self.inFlightKeys.remove(serial)
+            if let image = fetched {
+                self.memoryCache.setObject(image, forKey: serial as NSString)
+                self.revision &+= 1
+            } else {
+                self.failedKeys.insert(serial)
+            }
+        }
+    }
+
+    private nonisolated static func downloadCoverFromRepositories(serial: String) async -> UIImage? {
+        let candidateURLs: [URL] = [
+            URL(string: "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/default/\(serial).jpg"),
+            URL(string: "https://raw.githubusercontent.com/xlenore/ps2-covers/main/covers/3d/\(serial).png")
+        ].compactMap { $0 }
+
+        let config = URLSessionConfiguration.default
+        config.timeoutIntervalForRequest = 10
+        config.timeoutIntervalForResource = 15
+        let session = URLSession(configuration: config)
+
+        for url in candidateURLs {
+            do {
+                let (data, response) = try await session.data(from: url)
+                guard let http = response as? HTTPURLResponse,
+                      (200...299).contains(http.statusCode),
+                      data.count > 1024,
+                      let rawImage = UIImage(data: data) else {
+                    continue
+                }
+                let scaled = downscaleImage(rawImage, maxDimension: 512)
+                try? FileManager.default.createDirectory(at: coversDirectoryURL, withIntermediateDirectories: true)
+                if let jpegData = scaled.jpegData(compressionQuality: 0.85) {
+                    try? jpegData.write(to: serialCoverURL(for: serial), options: .atomic)
+                }
+                return scaled
+            } catch {
+                continue
+            }
+        }
+        return nil
+    }
+
+    private nonisolated static func downscaleImage(_ image: UIImage, maxDimension: CGFloat) -> UIImage {
+        let size = image.size
+        let longest = max(size.width, size.height)
+        guard longest > maxDimension, longest > 0 else { return image }
+        let scale = maxDimension / longest
+        let targetSize = CGSize(width: round(size.width * scale), height: round(size.height * scale))
+        let renderer = UIGraphicsImageRenderer(size: targetSize)
+        return renderer.image { _ in
+            image.draw(in: CGRect(origin: .zero, size: targetSize))
+        }
+    }
+
+    nonisolated static func normalizedSerial(_ discID: String) -> String {
+        let trimmed = discID.trimmingCharacters(in: .whitespacesAndNewlines).uppercased()
+        guard trimmed.range(of: #"^[A-Z]{4}-\d{5}$"#, options: .regularExpression) != nil else {
+            return ""
+        }
+        return trimmed
+    }
+
+    nonisolated static func serialCoverURL(for serial: String) -> URL {
+        coversDirectoryURL.appendingPathComponent("\(serial).jpg")
+    }
+
+    nonisolated static func customCoverURL(for gameID: UUID) -> URL {
+        coversDirectoryURL.appendingPathComponent("custom_\(gameID.uuidString).jpg")
+    }
+
+    nonisolated static func findSidecarCoverURL(for game: GameEntry) -> URL? {
+        let fm = FileManager.default
+        let stem = URL(fileURLWithPath: game.fileName).deletingPathExtension().lastPathComponent
+        let serial = normalizedSerial(game.discID)
+        let imageExts = ["jpg", "jpeg", "png", "webp"]
+        let dirs = [GameLibraryManager.gamesDirectoryURL, GameLibraryManager.legacyGamesDirectoryURL]
+
+        for dir in dirs {
+            for ext in imageExts {
+                let byStem = dir.appendingPathComponent("\(stem).\(ext)")
+                if fm.fileExists(atPath: byStem.path) { return byStem }
+                if !serial.isEmpty {
+                    let bySerial = dir.appendingPathComponent("\(serial).\(ext)")
+                    if fm.fileExists(atPath: bySerial.path) { return bySerial }
+                }
+            }
+        }
+        return nil
     }
 }
 
@@ -265,7 +450,6 @@ final class GameLibraryManager: ObservableObject {
 
     // MARK: - Automatic Folder Scanner (Reads Manual & Imported BIOS + Game Files)
 
-    /// Scans `Documents/bios` and `Documents/games` (plus legacy folders) so files dropped via iOS Files app are detected automatically.
     func rescanFolders() {
         Self.ensureDirectoriesExist()
 
@@ -273,10 +457,34 @@ final class GameLibraryManager: ObservableObject {
         self.detectedBIOSFiles = scannedBIOS
 
         let scannedGameURLs = Self.scanGameFilesOnDisk()
-        var updatedGames = games.filter { FileManager.default.fileExists(atPath: $0.fileURL.path) }
-        var knownLowerNames = Set(updatedGames.map { $0.fileName.lowercased() })
-
+        var updatedGames = Self.deduplicateCueBinEntries(
+            in: games.filter { FileManager.default.fileExists(atPath: $0.fileURL.path) }
+        )
         var didChange = (updatedGames.count != games.count)
+
+        // Refresh metadata for existing entries that still have placeholder discID or cue-only fileSize
+        for idx in updatedGames.indices {
+            let entry = updatedGames[idx]
+            let url = entry.fileURL
+            if entry.discID == "PS2-DISC" || entry.discID == "UNKNOWN" {
+                let extracted = Self.extractDiscID(from: url)
+                if extracted != "PS2-DISC" {
+                    updatedGames[idx].discID = extracted
+                    updatedGames[idx].region = Self.region(for: extracted)
+                    if let mappedTitle = Self.titleLookup[extracted] {
+                        updatedGames[idx].title = mappedTitle
+                    }
+                    didChange = true
+                }
+            }
+            let totalSize = Self.computeDiscTotalSize(at: url)
+            if totalSize > 0 && updatedGames[idx].fileSize != totalSize {
+                updatedGames[idx].fileSize = totalSize
+                didChange = true
+            }
+        }
+
+        var knownLowerNames = Set(updatedGames.map { $0.fileName.lowercased() })
 
         for fileURL in scannedGameURLs {
             let key = fileURL.lastPathComponent.lowercased()
@@ -288,10 +496,70 @@ final class GameLibraryManager: ObservableObject {
             }
         }
 
+        let finalGames = Self.deduplicateCueBinEntries(in: updatedGames)
+        if finalGames.count != updatedGames.count {
+            didChange = true
+        }
+
         if didChange {
-            self.games = updatedGames
+            self.games = finalGames
             saveLibrary()
         }
+
+        for game in self.games {
+            GameCoverCache.shared.fetchCoverIfNeeded(for: game)
+        }
+    }
+
+    /// Ensures any `.bin` file paired with a `.cue` sheet (either by CUE `FILE` reference or matching filename stem)
+    /// is never shown as a duplicate entry alongside the `.cue` entry.
+    nonisolated static func deduplicateCueBinEntries(in entries: [GameEntry]) -> [GameEntry] {
+        var referencedBins: Set<String> = []
+        var cueStems: Set<String> = []
+
+        var allCueURLs: [URL] = entries
+            .filter { URL(fileURLWithPath: $0.fileName).pathExtension.lowercased() == "cue" }
+            .map { $0.fileURL }
+
+        let fm = FileManager.default
+        for dir in [gamesDirectoryURL, legacyGamesDirectoryURL] {
+            if let diskItems = try? fm.contentsOfDirectory(at: dir, includingPropertiesForKeys: nil, options: [.skipsHiddenFiles]) {
+                for url in diskItems where url.pathExtension.lowercased() == "cue" {
+                    allCueURLs.append(url)
+                }
+            }
+        }
+
+        for cueURL in allCueURLs {
+            let stem = cueURL.deletingPathExtension().lastPathComponent.lowercased()
+            if !stem.isEmpty {
+                cueStems.insert(stem)
+            }
+            for binName in parseBinFilenames(inCueAt: cueURL) {
+                referencedBins.insert(binName.lowercased())
+            }
+        }
+
+        var seenFileNames: Set<String> = []
+        var filtered: [GameEntry] = []
+
+        for entry in entries {
+            let lowerName = entry.fileName.lowercased()
+            guard !seenFileNames.contains(lowerName) else { continue }
+
+            let url = URL(fileURLWithPath: entry.fileName)
+            if url.pathExtension.lowercased() == "bin" {
+                let stem = url.deletingPathExtension().lastPathComponent.lowercased()
+                if referencedBins.contains(lowerName) || cueStems.contains(stem) {
+                    continue
+                }
+            }
+
+            seenFileNames.insert(lowerName)
+            filtered.append(entry)
+        }
+
+        return filtered
     }
 
     /// Scans for valid PS2 BIOS dumps while ignoring `put your bios here.txt`.
@@ -313,7 +581,6 @@ final class GameLibraryManager: ObservableObject {
                 let name = url.lastPathComponent
                 let lowerName = name.lowercased()
 
-                // Ignore empty marker .txt files
                 if lowerName == biosPlaceholderFileName || lowerName == gamesPlaceholderFileName || lowerName.hasSuffix(".txt") {
                     continue
                 }
@@ -324,7 +591,6 @@ final class GameLibraryManager: ObservableObject {
                 let values = try? url.resourceValues(forKeys: [.isRegularFileKey, .fileSizeKey])
                 guard values?.isRegularFile == true else { continue }
 
-                // PS2 BIOS ROMs are typically 512 KB or 4 MB (nvm/mec companion files are smaller)
                 let size = values?.fileSize ?? 0
                 let isCompanion = (ext == "nvm" || ext == "mec")
                 guard isCompanion || size >= 256_000 else { continue }
@@ -336,7 +602,6 @@ final class GameLibraryManager: ObservableObject {
             }
         }
 
-        // Prioritize primary BIOS ROM (.bin/.rom >= 256 KB) first, especially scph* files
         return found.sorted { lhs, rhs in
             let lName = lhs.lastPathComponent.lowercased()
             let rName = rhs.lastPathComponent.lowercased()
@@ -384,9 +649,13 @@ final class GameLibraryManager: ObservableObject {
             }
         }
 
-        // Collect all .bin filenames referenced by .cue sheets so multi-track .bin files are not listed as duplicate games
         var referencedBins: Set<String> = []
+        var cueStems: Set<String> = []
         for url in allCandidates where url.pathExtension.lowercased() == "cue" {
+            let stem = url.deletingPathExtension().lastPathComponent.lowercased()
+            if !stem.isEmpty {
+                cueStems.insert(stem)
+            }
             for binName in parseBinFilenames(inCueAt: url) {
                 referencedBins.insert(binName.lowercased())
             }
@@ -394,13 +663,14 @@ final class GameLibraryManager: ObservableObject {
 
         return allCandidates.filter { url in
             if url.pathExtension.lowercased() == "bin" {
-                return !referencedBins.contains(url.lastPathComponent.lowercased())
+                let lowerName = url.lastPathComponent.lowercased()
+                let stem = url.deletingPathExtension().lastPathComponent.lowercased()
+                return !referencedBins.contains(lowerName) && !cueStems.contains(stem)
             }
             return true
         }
     }
 
-    /// Copies a BIOS file into `Documents/bios` if it came from an external picker location, or stages a temporary copy if already inside `Documents/bios` so `EmulatorState.importBIOS(from:)` never collides with itself.
     nonisolated static func prepareBIOSForEmulator(from sourceURL: URL) throws -> (url: URL, isTemporary: Bool) {
         ensureDirectoriesExist()
         let fm = FileManager.default
@@ -432,7 +702,8 @@ final class GameLibraryManager: ObservableObject {
 
         if let data = try? Data(contentsOf: Self.libraryIndexURL),
            let decoded = try? decoder.decode([GameEntry].self, from: data) {
-            self.games = decoded.filter { FileManager.default.fileExists(atPath: $0.fileURL.path) }
+            let existing = decoded.filter { FileManager.default.fileExists(atPath: $0.fileURL.path) }
+            self.games = Self.deduplicateCueBinEntries(in: existing)
         }
 
         if let colData = try? Data(contentsOf: Self.collectionsIndexURL),
@@ -525,8 +796,13 @@ final class GameLibraryManager: ObservableObject {
                 let binURL = Self.gamesDirectoryURL.appendingPathComponent(binName)
                 try? FileManager.default.removeItem(at: binURL)
             }
+            let matchingStemBin = Self.gamesDirectoryURL
+                .appendingPathComponent(url.deletingPathExtension().lastPathComponent)
+                .appendingPathExtension("bin")
+            try? FileManager.default.removeItem(at: matchingStemBin)
         }
 
+        GameCoverCache.shared.removeCustomCover(for: game)
         games.removeAll { $0.id == game.id }
         saveLibrary()
     }
@@ -574,7 +850,12 @@ final class GameLibraryManager: ObservableObject {
                     games.insert(entry, at: 0)
                 }
             }
+            games = Self.deduplicateCueBinEntries(in: games)
             saveLibrary()
+
+            for entry in games {
+                GameCoverCache.shared.fetchCoverIfNeeded(for: entry)
+            }
         } catch {
             lastImportError = error.localizedDescription
         }
@@ -607,7 +888,12 @@ final class GameLibraryManager: ObservableObject {
         var results: [GameEntry] = []
 
         var consumedBinNames: Set<String> = []
+        var cueStems: Set<String> = []
         for cueURL in cueURLs {
+            let stem = cueURL.deletingPathExtension().lastPathComponent.lowercased()
+            if !stem.isEmpty {
+                cueStems.insert(stem)
+            }
             let entry = try copyCUE(cueURL: cueURL, availableBins: binURLs)
             results.append(entry)
             for binName in parseBinFilenames(inCueAt: entry.fileURL) {
@@ -615,7 +901,13 @@ final class GameLibraryManager: ObservableObject {
             }
         }
 
-        for binURL in binURLs where !consumedBinNames.contains(binURL.lastPathComponent.lowercased()) {
+        // Only treat a .bin as standalone if it is NOT referenced by any .cue and does not share a stem with a .cue
+        for binURL in binURLs {
+            let lowerBinName = binURL.lastPathComponent.lowercased()
+            let binStem = binURL.deletingPathExtension().lastPathComponent.lowercased()
+            if consumedBinNames.contains(lowerBinName) || cueStems.contains(binStem) {
+                continue
+            }
             let destURL = try copyISO(from: binURL)
             results.append(GameEntry(url: destURL))
         }
@@ -652,7 +944,12 @@ final class GameLibraryManager: ObservableObject {
             try coordinatedCopy(from: cueURL, to: destCueURL)
         }
 
-        let expectedBins = parseBinFilenames(inCueAt: destCueURL)
+        var expectedBins = parseBinFilenames(inCueAt: destCueURL)
+        let cueStem = cueURL.deletingPathExtension().lastPathComponent
+        if expectedBins.isEmpty {
+            expectedBins = ["\(cueStem).bin"]
+        }
+
         let sourceDir = cueURL.deletingLastPathComponent()
 
         for expectedBinName in expectedBins {
@@ -663,6 +960,12 @@ final class GameLibraryManager: ObservableObject {
             }) {
                 if matchedPickedBin.standardizedFileURL != destBinURL.standardizedFileURL {
                     try coordinatedCopy(from: matchedPickedBin, to: destBinURL)
+                }
+            } else if availableBins.count == 1 && expectedBins.count == 1,
+                      let singleBin = availableBins.first,
+                      singleBin.deletingPathExtension().lastPathComponent.caseInsensitiveCompare(cueStem) == .orderedSame {
+                if singleBin.standardizedFileURL != destBinURL.standardizedFileURL {
+                    try coordinatedCopy(from: singleBin, to: destBinURL)
                 }
             } else {
                 let siblingURL = sourceDir.appendingPathComponent(expectedBinName)
@@ -704,6 +1007,7 @@ final class GameLibraryManager: ObservableObject {
         }
     }
 
+    /// Parses `.bin` filenames from a `.cue` sheet (supports quoted paths, unquoted paths, tabs, and Windows `\` separators).
     nonisolated static func parseBinFilenames(inCueAt cueURL: URL) -> [String] {
         guard let content = (try? String(contentsOf: cueURL, encoding: .utf8))
             ?? (try? String(contentsOf: cueURL, encoding: .ascii)) else {
@@ -713,17 +1017,59 @@ final class GameLibraryManager: ObservableObject {
         var bins: [String] = []
         for line in content.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
-            guard trimmed.uppercased().hasPrefix("FILE ") else { continue }
-            if let firstQuote = trimmed.firstIndex(of: "\""),
-               let lastQuote = trimmed[trimmed.index(after: firstQuote)...].firstIndex(of: "\"") {
-                let rawName = String(trimmed[trimmed.index(after: firstQuote)..<lastQuote])
-                let fileName = URL(fileURLWithPath: rawName).lastPathComponent
-                if !fileName.isEmpty {
-                    bins.append(fileName)
+            let upper = trimmed.uppercased()
+            guard upper.hasPrefix("FILE ") || upper.hasPrefix("FILE\t") else { continue }
+
+            let afterKeyword = trimmed.dropFirst(4).trimmingCharacters(in: .whitespaces)
+            let rawPath: String
+            if afterKeyword.hasPrefix("\"") {
+                let inner = afterKeyword.dropFirst()
+                if let endQuote = inner.firstIndex(of: "\"") {
+                    rawPath = String(inner[..<endQuote])
+                } else {
+                    continue
                 }
+            } else {
+                rawPath = afterKeyword.components(separatedBy: .whitespaces).first ?? ""
+            }
+
+            let normalized = rawPath.replacingOccurrences(of: "\\", with: "/")
+            let fileName = URL(fileURLWithPath: normalized).lastPathComponent
+            if !fileName.isEmpty {
+                bins.append(fileName)
             }
         }
         return bins
+    }
+
+    /// Computes the total size in bytes of a disc entry (for `.cue`, sums the `.cue` plus all referenced `.bin` files).
+    nonisolated static func computeDiscTotalSize(at url: URL) -> Int64 {
+        let fm = FileManager.default
+        let baseSize = (try? url.resourceValues(forKeys: [.fileSizeKey]).fileSize).map { Int64($0) } ?? 0
+        guard url.pathExtension.lowercased() == "cue" else {
+            return baseSize
+        }
+
+        var total = baseSize
+        let dir = url.deletingLastPathComponent()
+        var binNames = parseBinFilenames(inCueAt: url)
+        if binNames.isEmpty {
+            binNames = ["\(url.deletingPathExtension().lastPathComponent).bin"]
+        }
+
+        var counted: Set<String> = []
+        for binName in binNames {
+            let key = binName.lowercased()
+            guard !counted.contains(key) else { continue }
+            counted.insert(key)
+
+            let binURL = dir.appendingPathComponent(binName)
+            if fm.fileExists(atPath: binURL.path),
+               let sz = (try? binURL.resourceValues(forKeys: [.fileSizeKey]).fileSize).map({ Int64($0) }) {
+                total += sz
+            }
+        }
+        return total
     }
 
     // MARK: - Disc ID & Title Metadata Lookup
@@ -732,30 +1078,110 @@ final class GameLibraryManager: ObservableObject {
         let pattern = #"(SLUS|SCUS|SLES|SCES|SLPM|SLPS|SCPS|SLAJ|SCAJ|SLKA|SCKA)[-_]?(\d{3})\.?(\d{2})"#
         let regex = try? NSRegularExpression(pattern: pattern, options: .caseInsensitive)
 
-        let filename = url.lastPathComponent
-        if let match = regex?.firstMatch(in: filename, range: NSRange(filename.startIndex..., in: filename)),
-           let prefixRange = Range(match.range(at: 1), in: filename),
-           let part1Range = Range(match.range(at: 2), in: filename),
-           let part2Range = Range(match.range(at: 3), in: filename) {
-            return "\(filename[prefixRange].uppercased())-\(filename[part1Range])\(filename[part2Range])"
+        func matchSerial(in text: String) -> String? {
+            guard let match = regex?.firstMatch(in: text, range: NSRange(text.startIndex..., in: text)),
+                  let prefixRange = Range(match.range(at: 1), in: text),
+                  let part1Range = Range(match.range(at: 2), in: text),
+                  let part2Range = Range(match.range(at: 3), in: text) else {
+                return nil
+            }
+            return "\(text[prefixRange].uppercased())-\(text[part1Range])\(text[part2Range])"
+        }
+
+        if let serial = matchSerial(in: url.lastPathComponent) {
+            return serial
         }
 
         let ext = url.pathExtension.lowercased()
-        if (ext == "iso" || ext == "bin"),
-           let handle = try? FileHandle(forReadingFrom: url) {
+        let targetURL: URL
+        if ext == "cue" {
+            let dir = url.deletingLastPathComponent()
+            let bins = parseBinFilenames(inCueAt: url)
+            if let firstBin = bins.first {
+                targetURL = dir.appendingPathComponent(firstBin)
+            } else {
+                targetURL = dir.appendingPathComponent("\(url.deletingPathExtension().lastPathComponent).bin")
+            }
+        } else {
+            targetURL = url
+        }
+
+        let targetExt = targetURL.pathExtension.lowercased()
+        if (targetExt == "iso" || targetExt == "bin"),
+           let handle = try? FileHandle(forReadingFrom: targetURL) {
             defer { try? handle.close() }
+
+            if let serialFromCNF = readSerialFromISO9660(handle: handle, matchSerial: matchSerial) {
+                return serialFromCNF
+            }
+
+            try? handle.seek(toOffset: 0)
             if let headerData = try? handle.read(upToCount: 524_288),
-               let ascii = String(data: headerData, encoding: .ascii) {
-                if let match = regex?.firstMatch(in: ascii, range: NSRange(ascii.startIndex..., in: ascii)),
-                   let prefixRange = Range(match.range(at: 1), in: ascii),
-                   let part1Range = Range(match.range(at: 2), in: ascii),
-                   let part2Range = Range(match.range(at: 3), in: ascii) {
-                    return "\(ascii[prefixRange].uppercased())-\(ascii[part1Range])\(ascii[part2Range])"
-                }
+               let ascii = String(data: headerData, encoding: .ascii),
+               let serial = matchSerial(in: ascii) {
+                return serial
             }
         }
 
         return "PS2-DISC"
+    }
+
+    private nonisolated static func readSerialFromISO9660(
+        handle: FileHandle,
+        matchSerial: (String) -> String?
+    ) -> String? {
+        let geometries: [(sectorSize: UInt64, dataOffset: UInt64)] = [
+            (2048, 0),
+            (2352, 24),
+            (2352, 16)
+        ]
+
+        for geom in geometries {
+            let pvdPos = 16 * geom.sectorSize + geom.dataOffset
+            guard (try? handle.seek(toOffset: pvdPos)) != nil,
+                  let pvd = try? handle.read(upToCount: 2048),
+                  pvd.count >= 170,
+                  pvd[0] == 0x01,
+                  String(bytes: pvd[1...5], encoding: .ascii) == "CD001" else {
+                continue
+            }
+
+            let rootLBA = pvd.withUnsafeBytes { $0.load(fromByteOffset: 158, as: UInt32.self).littleEndian }
+            let rootSize = min(UInt32(65536), pvd.withUnsafeBytes { $0.load(fromByteOffset: 166, as: UInt32.self).littleEndian })
+            guard rootLBA > 0, rootSize > 0 else { continue }
+
+            let rootPos = UInt64(rootLBA) * geom.sectorSize + geom.dataOffset
+            guard (try? handle.seek(toOffset: rootPos)) != nil,
+                  let dirData = try? handle.read(upToCount: Int(rootSize)) else {
+                continue
+            }
+
+            var off = 0
+            while off + 33 < dirData.count {
+                let recLen = Int(dirData[off])
+                guard recLen > 0, off + recLen <= dirData.count else { break }
+                let nameLen = Int(dirData[off + 32])
+                if off + 33 + nameLen <= dirData.count {
+                    var name = String(bytes: dirData[(off + 33)..<(off + 33 + nameLen)], encoding: .ascii) ?? ""
+                    if let semi = name.firstIndex(of: ";") {
+                        name = String(name[..<semi])
+                    }
+                    if name.uppercased() == "SYSTEM.CNF" {
+                        let cnfLBA = dirData.withUnsafeBytes { $0.load(fromByteOffset: off + 2, as: UInt32.self).littleEndian }
+                        let cnfSize = min(4096, Int(dirData.withUnsafeBytes { $0.load(fromByteOffset: off + 10, as: UInt32.self).littleEndian }))
+                        let cnfPos = UInt64(cnfLBA) * geom.sectorSize + geom.dataOffset
+                        if (try? handle.seek(toOffset: cnfPos)) != nil,
+                           let cnfData = try? handle.read(upToCount: cnfSize),
+                           let cnfText = String(data: cnfData, encoding: .ascii),
+                           let serial = matchSerial(cnfText) {
+                            return serial
+                        }
+                    }
+                }
+                off += recLen
+            }
+        }
+        return nil
     }
 
     nonisolated static func region(for discID: String) -> String {
