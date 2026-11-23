@@ -34,9 +34,7 @@ public final class EmulatorState: ObservableObject {
 
     let emulator = PS2Emulator()
     private var fpsTimer: Timer?
-    private nonisolated(unsafe) var frameCount: Int = 0
-    private nonisolated(unsafe) var isPresentingFrame: Bool = false
-    private let frameGate = NSLock()
+    private var frameCount: Int = 0
 
     // MARK: - Status
 
@@ -57,28 +55,12 @@ public final class EmulatorState: ObservableObject {
     private func setupFrameCallback() {
         emulator.onFrameReady = { [weak self] data, width, height in
             guard let self else { return }
-            let shouldSkip = self.frameGate.withLock {
-                self.frameCount += 1
-                if self.isPresentingFrame {
-                    return true
-                }
-                self.isPresentingFrame = true
-                return false
-            }
-            if shouldSkip { return }
-
-            guard let image = UIImage.fromRGBA(data: data, width: width, height: height) else {
-                self.frameGate.withLock {
-                    self.isPresentingFrame = false
-                }
-                return
-            }
-
-            DispatchQueue.main.async { [weak self] in
+            let image = UIImage.fromRGBA(data: data, width: width, height: height)
+            Task { @MainActor [weak self] in
                 guard let self else { return }
-                self.frameImage = image
-                self.frameGate.withLock {
-                    self.isPresentingFrame = false
+                self.frameCount += 1
+                if let image {
+                    self.frameImage = image
                 }
             }
         }
@@ -202,11 +184,6 @@ public final class EmulatorState: ObservableObject {
 
     func launch(game: GameEntry) {
         status = .loading
-        frameGate.withLock {
-            frameCount = 0
-            isPresentingFrame = false
-        }
-
         Task { @MainActor [weak self] in
             guard let self else { return }
             do {
@@ -252,10 +229,6 @@ public final class EmulatorState: ObservableObject {
         frameImage = nil
         fpsTimer?.invalidate()
         fpsTimer = nil
-        frameGate.withLock {
-            frameCount = 0
-            isPresentingFrame = false
-        }
     }
 
     // MARK: - Save States
@@ -297,13 +270,8 @@ public final class EmulatorState: ObservableObject {
         fpsTimer = Timer.scheduledTimer(withTimeInterval: 1.0, repeats: true) { [weak self] _ in
             guard let self else { return }
             Task { @MainActor in
-                let count = self.frameGate.withLock {
-                    let current = self.frameCount
-                    self.frameCount = 0
-                    return current
-                }
-
-                self.fps = Double(count)
+                self.fps = Double(self.frameCount)
+                self.frameCount = 0
                 self.jitBlockCount = self.emulator.jitCache.blockCount
                 self.jitHitRate   = self.emulator.jitCache.hitRate
             }
@@ -315,7 +283,7 @@ public final class EmulatorState: ObservableObject {
 
 extension UIImage {
     static func fromRGBA(data: Data, width: Int, height: Int) -> UIImage? {
-        guard width > 0, height > 0, data.count >= width * height * 4 else { return nil }
+        guard data.count >= width * height * 4 else { return nil }
         let colorSpace = CGColorSpaceCreateDeviceRGB()
         let bitmapInfo = CGBitmapInfo.byteOrder32Big.rawValue | CGImageAlphaInfo.premultipliedLast.rawValue
         guard let provider = CGDataProvider(data: data as CFData),
