@@ -20,11 +20,15 @@ public final class EmotionEngine {
     var sa: UInt32 = 0
     /// COP0 system control registers
     var cop0: COP0Registers = COP0Registers()
+    /// Live COP0 Count ($9) timer register for BIOS/game delay loops
+    private var cop0Count: UInt32 = 0
     /// 32 floating-point registers (COP1 FPU)
     var fpr: [Float] = Array(repeating: 0, count: 32)
     var fpAcc: Float = 0
+    var fcr31: UInt32 = 0
     /// Branch delay slot state
     var inDelaySlot: Bool = false
+    var nullifyDelaySlot: Bool = false
     var nextPC: UInt32 = 0
 
     // MARK: - Cycle Counter
@@ -33,6 +37,7 @@ public final class EmotionEngine {
 
     // MARK: - References
     weak var bus: MemoryBus?
+    weak var vu0: VectorUnit?
 
     // MARK: - Init
 
@@ -45,10 +50,42 @@ public final class EmotionEngine {
         gpr = Array(repeating: UInt128(hi: 0, lo: 0), count: 32)
         pc = 0xBFC00000
         hi = 0; lo = 0; hi1 = 0; lo1 = 0
+        sa = 0
         cycles = 0
+        cop0Count = 0
         cop0.reset()
         inDelaySlot = false
+        nullifyDelaySlot = false
         nextPC = pc &+ 4
+    }
+
+    // MARK: - Interrupt Delivery
+
+    func checkAndDeliverInterrupt(intcPending: Bool) {
+        guard intcPending else { return }
+        let status = cop0.status
+        // EE global interrupt enable requires IE (bit 0) == 1, EIE (bit 16) == 1,
+        // EXL (bit 1) == 0, ERL (bit 2) == 0, and IM2 (bit 10) == 1
+        let ie  = (status & 0x1) != 0
+        let exl = (status & 0x2) != 0
+        let erl = (status & 0x4) != 0
+        let im2 = (status & (1 << 10)) != 0
+        let eie = (status & (1 << 16)) != 0
+        guard ie && eie && !exl && !erl && im2 else { return }
+
+        cop0.epc = inDelaySlot ? (pc &- 4) : pc
+        var cause = cop0.read(register: 13)
+        cause = (cause & ~(0x1F << 2)) | (1 << 10) // ExcCode = 0 (Interrupt), IP2 = 1
+        if inDelaySlot {
+            cause |= (1 << 31)
+        } else {
+            cause &= ~(1 << 31)
+        }
+        cop0.write(register: 13, value: cause)
+        cop0.status |= (1 << 1) // Set EXL
+        inDelaySlot = false
+        nullifyDelaySlot = false
+        pc = ((status & (1 << 22)) != 0) ? 0xBFC00380 : 0x80000180
     }
 
     // MARK: - Step
@@ -57,6 +94,7 @@ public final class EmotionEngine {
         for _ in 0..<count {
             executeOne()
             cycles &+= 1
+            cop0Count &+= 1
         }
     }
 
@@ -65,6 +103,10 @@ public final class EmotionEngine {
     /// Execute a pre-compiled block of decoded instructions (JIT mode).
     func executeBlock(_ block: CompiledBlock) {
         for decoded in block.instructions {
+            if nullifyDelaySlot {
+                nullifyDelaySlot = false
+                break
+            }
             if inDelaySlot {
                 pc = nextPC
                 inDelaySlot = false
@@ -73,6 +115,7 @@ public final class EmotionEngine {
             }
             dispatchDecoded(decoded)
             cycles &+= 1
+            cop0Count &+= 1
         }
     }
 
@@ -100,8 +143,12 @@ public final class EmotionEngine {
         case 0x12: decodeCOP2(rs: d.rs, rt: d.rt, rd: d.rd, instruction: d.raw)
         case 0x14: executeBEQL(rs: d.rs, rt: d.rt, offset: d.imm16)
         case 0x15: executeBNEL(rs: d.rs, rt: d.rt, offset: d.imm16)
-        case 0x18: executeDDIVI(rt: d.rt, rs: d.rs, imm: d.imm16)
+        case 0x16: executeBLEZL(rs: d.rs, offset: d.imm16)
+        case 0x17: executeBGTZL(rs: d.rs, offset: d.imm16)
+        case 0x18: executeDADDI(rt: d.rt, rs: d.rs, imm: d.imm16)
         case 0x19: executeDADDIU(rt: d.rt, rs: d.rs, imm: d.imm16)
+        case 0x1A: executeLDL(rt: d.rt, base: d.rs, offset: d.imm16)
+        case 0x1B: executeLDR(rt: d.rt, base: d.rs, offset: d.imm16)
         case 0x1C: decodeMMI(instruction: d.raw)
         case 0x1E: executeLQ(rt: d.rt, base: d.rs, offset: d.imm16)
         case 0x1F: executeSQ(rt: d.rt, base: d.rs, offset: d.imm16)
@@ -115,9 +162,16 @@ public final class EmotionEngine {
         case 0x27: executeLWU(rt: d.rt, base: d.rs, offset: d.imm16)
         case 0x28: executeSB(rt: d.rt, base: d.rs, offset: d.imm16)
         case 0x29: executeSH(rt: d.rt, base: d.rs, offset: d.imm16)
+        case 0x2A: executeSWL(rt: d.rt, base: d.rs, offset: d.imm16)
         case 0x2B: executeSW(rt: d.rt, base: d.rs, offset: d.imm16)
-        case 0x2F: executeSD(rt: d.rt, base: d.rs, offset: d.imm16)
+        case 0x2C: executeSDL(rt: d.rt, base: d.rs, offset: d.imm16)
+        case 0x2D: executeSDR(rt: d.rt, base: d.rs, offset: d.imm16)
+        case 0x2E: executeSWR(rt: d.rt, base: d.rs, offset: d.imm16)
+        case 0x2F: break // CACHE instruction (no-op in interpreter/JIT)
+        case 0x31: executeLWC1(ft: d.rt, base: d.rs, offset: d.imm16)
+        case 0x33: break // PREF instruction (no-op)
         case 0x37: executeLD(rt: d.rt, base: d.rs, offset: d.imm16)
+        case 0x39: executeSWC1(ft: d.rt, base: d.rs, offset: d.imm16)
         case 0x3F: executeSD(rt: d.rt, base: d.rs, offset: d.imm16)
         default:   handleUnknownInstruction(op: d.op)
         }
@@ -125,6 +179,12 @@ public final class EmotionEngine {
 
     private func executeOne() {
         guard let bus = bus else { return }
+        if nullifyDelaySlot {
+            nullifyDelaySlot = false
+            pc &+= 4
+            return
+        }
+
         let instruction = bus.read32(address: pc)
 
         if inDelaySlot {
@@ -171,8 +231,12 @@ public final class EmotionEngine {
         case 0x12: decodeCOP2(rs: rs, rt: rt, rd: rd, instruction: instruction)
         case 0x14: executeBEQL(rs: rs, rt: rt, offset: imm16)
         case 0x15: executeBNEL(rs: rs, rt: rt, offset: imm16)
-        case 0x18: executeDDIVI(rt: rt, rs: rs, imm: imm16)
+        case 0x16: executeBLEZL(rs: rs, offset: imm16)
+        case 0x17: executeBGTZL(rs: rs, offset: imm16)
+        case 0x18: executeDADDI(rt: rt, rs: rs, imm: imm16)
         case 0x19: executeDADDIU(rt: rt, rs: rs, imm: imm16)
+        case 0x1A: executeLDL(rt: rt, base: rs, offset: imm16)
+        case 0x1B: executeLDR(rt: rt, base: rs, offset: imm16)
         case 0x1C: decodeMMI(instruction: instruction)
         case 0x1E: executeLQ(rt: rt, base: rs, offset: imm16)
         case 0x1F: executeSQ(rt: rt, base: rs, offset: imm16)
@@ -186,9 +250,16 @@ public final class EmotionEngine {
         case 0x27: executeLWU(rt: rt, base: rs, offset: imm16)
         case 0x28: executeSB(rt: rt, base: rs, offset: imm16)
         case 0x29: executeSH(rt: rt, base: rs, offset: imm16)
+        case 0x2A: executeSWL(rt: rt, base: rs, offset: imm16)
         case 0x2B: executeSW(rt: rt, base: rs, offset: imm16)
-        case 0x2F: executeSD(rt: rt, base: rs, offset: imm16)
+        case 0x2C: executeSDL(rt: rt, base: rs, offset: imm16)
+        case 0x2D: executeSDR(rt: rt, base: rs, offset: imm16)
+        case 0x2E: executeSWR(rt: rt, base: rs, offset: imm16)
+        case 0x2F: break // CACHE
+        case 0x31: executeLWC1(ft: rt, base: rs, offset: imm16)
+        case 0x33: break // PREF
         case 0x37: executeLD(rt: rt, base: rs, offset: imm16)
+        case 0x39: executeSWC1(ft: rt, base: rs, offset: imm16)
         case 0x3F: executeSD(rt: rt, base: rs, offset: imm16)
         default:
             handleUnknownInstruction(op: op)
@@ -207,6 +278,8 @@ public final class EmotionEngine {
         case 0x07: executeSRAV(rd: rd, rt: rt, rs: rs)
         case 0x08: executeJR(rs: rs)
         case 0x09: executeJALR(rd: rd, rs: rs)
+        case 0x0A: if gpr64(rt) == 0 && rd != 0 { gpr[rd] = gpr[rs] } // MOVZ
+        case 0x0B: if gpr64(rt) != 0 && rd != 0 { gpr[rd] = gpr[rs] } // MOVN
         case 0x0C: executeSYSCALL()
         case 0x0F: executeSYNC()
         case 0x10: executeMFHI(rd: rd)
@@ -257,6 +330,12 @@ public final class EmotionEngine {
         case 0x03: executeBGEZL(rs: rs, offset: offset)
         case 0x10: executeBLTZAL(rs: rs, offset: offset)
         case 0x11: executeBGEZAL(rs: rs, offset: offset)
+        case 0x12: // BLTZALL
+            setGPR(31, value: UInt64(pc &+ 4))
+            if Int64(bitPattern: gpr64(rs)) < 0 { branchTo(offset: offset) } else { skipDelaySlot() }
+        case 0x13: // BGEZALL
+            setGPR(31, value: UInt64(pc &+ 4))
+            if Int64(bitPattern: gpr64(rs)) >= 0 { branchTo(offset: offset) } else { skipDelaySlot() }
         default: break
         }
     }
@@ -286,14 +365,21 @@ public final class EmotionEngine {
     private func decodeCOP1(rs: Int, rt: Int, rd: Int, funct: UInt32, instruction: UInt32) {
         switch rs {
         case 0x00: executeMFC1(rt: rt, fs: rd)
+        case 0x02: // CFC1
+            setGPR32(rt, value: rd == 0 ? 0x0000_2E00 : Int32(bitPattern: fcr31))
         case 0x04: executeMTC1(rt: rt, fs: rd)
+        case 0x06: // CTC1
+            if rd == 31 { fcr31 = gpr32(rt) }
         case 0x08:
             let cc = (instruction >> 18) & 0x7
             let nd = (instruction >> 17) & 0x1
             let tf = (instruction >> 16) & 0x1
             executeFPUBranch(cc: cc, nd: nd, tf: tf, offset: Int32(Int16(bitPattern: UInt16(instruction & 0xFFFF))))
         case 0x10:
-            decodeFPUArith(funct: funct, fd: rd, fs: Int((instruction >> 11) & 0x1F), ft: rt)
+            decodeFPUArith(funct: funct, fd: Int((instruction >> 6) & 0x1F), fs: rd, ft: rt)
+        case 0x14: // FMT = W (CVT.S.W)
+            let fd = Int((instruction >> 6) & 0x1F)
+            fpr[fd] = Float(Int32(bitPattern: fpr[rd].bitPattern))
         default: break
         }
     }
@@ -313,9 +399,10 @@ public final class EmotionEngine {
         case 0x1D: fpAcc -= fpr[fs] * fpr[ft]
         case 0x1E: fpr[fd] = fpAcc + fpr[fs] * fpr[ft]
         case 0x1F: fpr[fd] = fpAcc - fpr[fs] * fpr[ft]
-        case 0x24: fpr[fd] = Float(Int32(bitPattern: UInt32(gpr[fs].lo32)))
+        case 0x24: fpr[fd] = Float(bitPattern: UInt32(bitPattern: Int32(fpr[fs])))
         case 0x28: cop0.fcr31_cond = fpr[fs] < fpr[ft]
         case 0x32: cop0.fcr31_cond = fpr[fs] == fpr[ft]
+        case 0x34: cop0.fcr31_cond = fpr[fs] <= fpr[ft]
         default: break
         }
     }
@@ -323,21 +410,37 @@ public final class EmotionEngine {
     // MARK: - MMI (Multimedia Instructions — PS2 SIMD)
 
     private func decodeMMI(instruction: UInt32) {
-        // MMI extends MIPS with 128-bit SIMD operations across the 128-bit GPRs
-        // Subset implementation
         let funct = instruction & 0x3F
         let rs    = Int((instruction >> 21) & 0x1F)
         let rt    = Int((instruction >> 16) & 0x1F)
         let rd    = Int((instruction >> 11) & 0x1F)
         switch funct {
-        case 0x08: // MMI0
-            decodeMMI0(instruction: instruction, rs: rs, rt: rt, rd: rd)
-        case 0x09: // MMI2
-            decodeMMI2(instruction: instruction, rs: rs, rt: rt, rd: rd)
-        case 0x28: // MMI1
-            decodeMMI1(instruction: instruction, rs: rs, rt: rt, rd: rd)
-        case 0x29: // MMI3
-            decodeMMI3(instruction: instruction, rs: rs, rt: rt, rd: rd)
+        case 0x00: // MADD
+            let a = Int64(Int32(bitPattern: gpr[rs].lo32)) &* Int64(Int32(bitPattern: gpr[rt].lo32))
+            let cur = (Int64(bitPattern: hi) << 32) | Int64(lo & 0xFFFF_FFFF)
+            let res = cur &+ a
+            lo = UInt64(bitPattern: res) & 0xFFFF_FFFF
+            hi = UInt64(bitPattern: res) >> 32
+            if rd != 0 { setGPR64(rd, value: Int64(bitPattern: lo)) }
+        case 0x01: // MADDU
+            let a = UInt64(gpr[rs].lo32) * UInt64(gpr[rt].lo32)
+            let cur = ((hi & 0xFFFF_FFFF) << 32) | (lo & 0xFFFF_FFFF)
+            let res = cur &+ a
+            lo = res & 0xFFFF_FFFF
+            hi = res >> 32
+            if rd != 0 { setGPR64(rd, value: Int64(bitPattern: lo)) }
+        case 0x04: // PLZCW
+            if rd != 0 {
+                let w0 = gpr[rs].lo32
+                let w1 = UInt32(gpr[rs].lo64 >> 32)
+                let c0 = ((w0 & 0x8000_0000) != 0 ? ~w0 : w0).leadingZeroBitCount - 1
+                let c1 = ((w1 & 0x8000_0000) != 0 ? ~w1 : w1).leadingZeroBitCount - 1
+                gpr[rd] = UInt128(hi: 0, lo: UInt64(UInt32(max(0, c0))) | (UInt64(UInt32(max(0, c1))) << 32))
+            }
+        case 0x08: decodeMMI0(instruction: instruction, rs: rs, rt: rt, rd: rd)
+        case 0x09: decodeMMI2(instruction: instruction, rs: rs, rt: rt, rd: rd)
+        case 0x28: decodeMMI1(instruction: instruction, rs: rs, rt: rt, rd: rd)
+        case 0x29: decodeMMI3(instruction: instruction, rs: rs, rt: rt, rd: rd)
         case 0x18: // MULT1
             let a = Int64(Int32(truncatingIfNeeded: gpr[rs].lo64))
             let b = Int64(Int32(truncatingIfNeeded: gpr[rt].lo64))
@@ -359,37 +462,27 @@ public final class EmotionEngine {
         case 0x1B: // DIVU1
             let a = gpr[rs].lo32; let b = gpr[rt].lo32
             if b != 0 { lo1 = UInt64(a / b); hi1 = UInt64(a % b) }
-        case 0x10: // MFHI1
-            if rd != 0 { gpr[rd] = UInt128(hi: 0, lo: hi1) }
-        case 0x12: // MFLO1
-            if rd != 0 { gpr[rd] = UInt128(hi: 0, lo: lo1) }
-        case 0x11: // MTHI1
-            hi1 = gpr[rs].lo64
-        case 0x13: // MTLO1
-            lo1 = gpr[rs].lo64
-        default:
-            break
+        case 0x10: if rd != 0 { gpr[rd] = UInt128(hi: 0, lo: hi1) }
+        case 0x12: if rd != 0 { gpr[rd] = UInt128(hi: 0, lo: lo1) }
+        case 0x11: hi1 = gpr[rs].lo64
+        case 0x13: lo1 = gpr[rs].lo64
+        default: break
         }
     }
 
     private func decodeMMI0(instruction: UInt32, rs: Int, rt: Int, rd: Int) {
         let subfunc = (instruction >> 6) & 0x1F
         switch subfunc {
-        case 0x00: // PADDW — add 32-bit words in parallel
-            let a = gpr[rs]; let b = gpr[rt]
-            gpr[rd] = UInt128(
-                hi: (a.hi &+ b.hi),
-                lo: (a.lo &+ b.lo)
-            )
-        case 0x04: // PADDH — add 16-bit halfwords in parallel
+        case 0x00:
+            if rd != 0 { gpr[rd] = UInt128(hi: gpr[rs].hi &+ gpr[rt].hi, lo: gpr[rs].lo &+ gpr[rt].lo) }
+        case 0x04:
+            guard rd != 0 else { return }
             var result = UInt128(hi: 0, lo: 0)
             for i in 0..<8 {
-                let shift = i * 16
                 let av = UInt16(truncatingIfNeeded: (i < 4 ? gpr[rs].lo : gpr[rs].hi) >> ((i % 4) * 16))
                 let bv = UInt16(truncatingIfNeeded: (i < 4 ? gpr[rt].lo : gpr[rt].hi) >> ((i % 4) * 16))
                 let rv = UInt64(av &+ bv) << UInt64((i % 4) * 16)
                 if i < 4 { result.lo |= rv } else { result.hi |= rv }
-                _ = shift
             }
             gpr[rd] = result
         default: break
@@ -399,8 +492,8 @@ public final class EmotionEngine {
     private func decodeMMI1(instruction: UInt32, rs: Int, rt: Int, rd: Int) {
         let subfunc = (instruction >> 6) & 0x1F
         switch subfunc {
-        case 0x00: // PSUBW — subtract 32-bit words
-            gpr[rd] = UInt128(hi: gpr[rs].hi &- gpr[rt].hi, lo: gpr[rs].lo &- gpr[rt].lo)
+        case 0x00:
+            if rd != 0 { gpr[rd] = UInt128(hi: gpr[rs].hi &- gpr[rt].hi, lo: gpr[rs].lo &- gpr[rt].lo) }
         default: break
         }
     }
@@ -408,29 +501,25 @@ public final class EmotionEngine {
     private func decodeMMI2(instruction: UInt32, rs: Int, rt: Int, rd: Int) {
         let subfunc = (instruction >> 6) & 0x1F
         switch subfunc {
-        case 0x00: // PMADDW — 32-bit parallel multiply-add to HI1:LO1 and HI:LO
+        case 0x00:
             let a = Int64(Int32(bitPattern: gpr[rs].lo32)) * Int64(Int32(bitPattern: gpr[rt].lo32))
             let b = Int64(Int32(bitPattern: UInt32(gpr[rs].hi >> 32))) * Int64(Int32(bitPattern: UInt32(gpr[rt].hi >> 32)))
             lo = UInt64(bitPattern: Int64(bitPattern: lo) &+ a)
             hi = UInt64(bitPattern: Int64(bitPattern: hi) &+ b)
             if rd != 0 { gpr[rd] = UInt128(hi: hi, lo: lo) }
-        case 0x02: // PSRLVW — variable right shift
+        case 0x02:
             let shift = gpr[rt].lo32 & 0x1F
             let lo32 = gpr[rs].lo32 >> shift
             let hi32 = UInt32(gpr[rs].hi & 0xFFFF_FFFF) >> shift
-            if rd != 0 {
-                gpr[rd] = UInt128(hi: UInt64(hi32), lo: UInt64(lo32))
-            }
-        case 0x03: // PSRAVW — variable arithmetic right shift
+            if rd != 0 { gpr[rd] = UInt128(hi: UInt64(hi32), lo: UInt64(lo32)) }
+        case 0x03:
             let shift = gpr[rt].lo32 & 0x1F
             let lo32 = UInt32(bitPattern: Int32(bitPattern: gpr[rs].lo32) >> shift)
             let hi32 = UInt32(bitPattern: Int32(bitPattern: UInt32(gpr[rs].hi & 0xFFFF_FFFF)) >> shift)
             if rd != 0 { gpr[rd] = UInt128(hi: UInt64(hi32), lo: UInt64(lo32)) }
-        case 0x08: // PMFHI — move from HI register pipeline
-            if rd != 0 { gpr[rd] = UInt128(hi: hi1, lo: hi) }
-        case 0x09: // PMFLO
-            if rd != 0 { gpr[rd] = UInt128(hi: lo1, lo: lo) }
-        case 0x0A: // PINTH — interleave halfwords
+        case 0x08: if rd != 0 { gpr[rd] = UInt128(hi: hi1, lo: hi) }
+        case 0x09: if rd != 0 { gpr[rd] = UInt128(hi: lo1, lo: lo) }
+        case 0x0A:
             if rd != 0 {
                 let lo16_s = UInt64(gpr[rs].lo32 & 0xFFFF)
                 let hi16_s = UInt64((gpr[rs].lo32 >> 16) & 0xFFFF)
@@ -439,38 +528,36 @@ public final class EmotionEngine {
                 let r = lo16_t | (lo16_s << 16) | (hi16_t << 32) | (hi16_s << 48)
                 gpr[rd] = UInt128(hi: 0, lo: r)
             }
-        case 0x0C: // PMULTW — parallel multiply (32×32 → 64)
+        case 0x0C:
             let a = Int64(Int32(bitPattern: gpr[rs].lo32)) * Int64(Int32(bitPattern: gpr[rt].lo32))
             let b = Int64(Int32(bitPattern: UInt32(gpr[rs].hi & 0xFFFF_FFFF))) * Int64(Int32(bitPattern: UInt32(gpr[rt].hi & 0xFFFF_FFFF)))
             lo = UInt64(bitPattern: a); hi = UInt64(bitPattern: b)
             if rd != 0 { gpr[rd] = UInt128(hi: hi, lo: lo) }
-        case 0x0D: // PDIVW — parallel divide
+        case 0x0D:
             let b = Int32(bitPattern: gpr[rt].lo32)
             if b != 0 {
                 lo = UInt64(bitPattern: Int64(Int32(bitPattern: gpr[rs].lo32) / b))
                 hi = UInt64(bitPattern: Int64(Int32(bitPattern: gpr[rs].lo32) % b))
             }
-        case 0x0E: // PCPYLD — copy lower doubleword
+        case 0x0E: // PCPYLD
             if rd != 0 { gpr[rd] = UInt128(hi: gpr[rs].lo64, lo: gpr[rt].lo64) }
-        case 0x10: // PMADDH — parallel multiply-add halfwords
+        case 0x10:
             var result = UInt128(hi: 0, lo: 0)
             for i in 0..<4 {
-                let shift = i * 16
                 let av = Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: (i < 2 ? gpr[rs].lo : gpr[rs].hi) >> ((i % 2) * 16))))
                 let bv = Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: (i < 2 ? gpr[rt].lo : gpr[rt].hi) >> ((i % 2) * 16))))
                 let r = Int16(truncatingIfNeeded: av &* bv)
                 let rv = UInt64(bitPattern: Int64(r)) << UInt64((i % 2) * 16)
                 if i < 2 { result.lo |= rv } else { result.hi |= rv }
-                _ = shift
             }
             if rd != 0 { gpr[rd] = result }
-        case 0x12: // PEXEH — exchange halfwords
+        case 0x12:
             if rd != 0 {
                 let v = gpr[rt].lo32
                 let r = (v & 0xFFFF_0000) | ((v >> 16) & 0xFFFF)
                 gpr[rd] = UInt128(hi: gpr[rt].hi, lo: UInt64(r) | (gpr[rt].lo & 0xFFFF_FFFF_0000_0000))
             }
-        case 0x13: // PREVH — reverse halfwords
+        case 0x13:
             if rd != 0 {
                 var lo: UInt64 = 0; var hi: UInt64 = 0
                 for i in 0..<4 {
@@ -481,7 +568,7 @@ public final class EmotionEngine {
                 }
                 gpr[rd] = UInt128(hi: hi, lo: lo)
             }
-        case 0x14: // PMULTH — parallel multiply halfwords (no accumulate)
+        case 0x14:
             if rd != 0 {
                 var result = UInt128(hi: 0, lo: 0)
                 for i in 0..<4 {
@@ -492,23 +579,23 @@ public final class EmotionEngine {
                 }
                 gpr[rd] = result
             }
-        case 0x15: // PDIVBW — divide all 4 halfwords by BW
+        case 0x15:
             let bw = Int32(Int16(bitPattern: UInt16(gpr[rt].lo32 & 0xFFFF)))
-            if bw != 0 {
+            if bw != 0 && rd != 0 {
                 var result = UInt128(hi: 0, lo: 0)
                 for i in 0..<4 {
                     let av = Int32(Int16(bitPattern: UInt16(truncatingIfNeeded: (i < 2 ? gpr[rs].lo : gpr[rs].hi) >> UInt64((i % 2) * 16))))
                     let r = UInt64(bitPattern: Int64(av / bw)) << UInt64((i % 2) * 16)
                     if i < 2 { result.lo |= r } else { result.hi |= r }
                 }
-                if rd != 0 { gpr[rd] = result }
+                gpr[rd] = result
             }
-        case 0x16: // PEXEW — exchange words
+        case 0x16:
             if rd != 0 {
                 let lo32 = gpr[rt].lo32; let hi32 = UInt32(gpr[rt].hi & 0xFFFF_FFFF)
                 gpr[rd] = UInt128(hi: UInt64(lo32), lo: UInt64(hi32))
             }
-        case 0x17: // PROT3W — rotate 3 words
+        case 0x17:
             if rd != 0 {
                 let w0 = gpr[rt].lo32
                 let w1 = UInt32(gpr[rt].hi & 0xFFFF_FFFF)
@@ -522,52 +609,46 @@ public final class EmotionEngine {
     private func decodeMMI3(instruction: UInt32, rs: Int, rt: Int, rd: Int) {
         let subfunc = (instruction >> 6) & 0x1F
         switch subfunc {
-        case 0x00: // PMADDUW — parallel multiply-add unsigned
+        case 0x00:
             let a = UInt64(gpr[rs].lo32) * UInt64(gpr[rt].lo32)
             let b = UInt64(gpr[rs].hi & 0xFFFF_FFFF) * UInt64(gpr[rt].hi & 0xFFFF_FFFF)
             lo = lo &+ a; hi = hi &+ b
             if rd != 0 { gpr[rd] = UInt128(hi: hi, lo: lo) }
-        case 0x03: // PSRAVW (duplicate, already in MMI2)
-            break
-        case 0x08: // PMTHI
-            hi = gpr[rs].hi; hi1 = gpr[rs].lo64
-        case 0x09: // PMTLO
-            lo = gpr[rs].hi; lo1 = gpr[rs].lo64
-        case 0x0A: // PINTEH — interleave even halfwords
+        case 0x08: hi = gpr[rs].hi; hi1 = gpr[rs].lo64
+        case 0x09: lo = gpr[rs].hi; lo1 = gpr[rs].lo64
+        case 0x0A:
             if rd != 0 {
                 var r: UInt64 = 0
                 for i in 0..<4 {
-                    let sv = (i < 2 ? gpr[rs].lo : gpr[rs].hi) >> UInt64((i % 2) * 32) & 0xFFFF
                     let tv = (i < 2 ? gpr[rt].lo : gpr[rt].hi) >> UInt64((i % 2) * 32) & 0xFFFF
                     r |= tv << UInt64(i * 16)
-                    _ = sv
                 }
                 gpr[rd] = UInt128(hi: 0, lo: r)
             }
-        case 0x0C: // PMULTUW — unsigned 32×32 → 64
+        case 0x0C:
             let a = UInt64(gpr[rs].lo32) * UInt64(gpr[rt].lo32)
             let b = UInt64(gpr[rs].hi & 0xFFFF_FFFF) * UInt64(gpr[rt].hi & 0xFFFF_FFFF)
             lo = a; hi = b
             if rd != 0 { gpr[rd] = UInt128(hi: hi, lo: lo) }
-        case 0x0D: // PDIVUW — unsigned parallel divide
+        case 0x0D:
             let b = gpr[rt].lo32
             if b != 0 { lo = UInt64(gpr[rs].lo32 / b); hi = UInt64(gpr[rs].lo32 % b) }
-        case 0x0E: // PCPYUD — copy upper doubleword
+        case 0x0E: // PCPYUD
             if rd != 0 { gpr[rd] = UInt128(hi: gpr[rt].hi, lo: gpr[rs].hi) }
-        case 0x12: // PEXCH — exchange 16-bit chunks in upper/lower halfwords
+        case 0x12:
             if rd != 0 {
                 let lo32 = gpr[rt].lo32
                 let r = (lo32 & 0xFF00_00FF) | ((lo32 & 0x00FF_0000) >> 8) | ((lo32 & 0x0000_FF00) << 8)
                 gpr[rd] = UInt128(hi: gpr[rt].hi, lo: UInt64(r) | (gpr[rt].lo & 0xFFFF_FFFF_0000_0000))
             }
-        case 0x13: // PCPYH — copy halfword
+        case 0x13:
             if rd != 0 {
                 let hw = gpr[rt].lo & 0xFFFF
                 var lo: UInt64 = 0; var hi: UInt64 = 0
                 for i in 0..<4 { let s = hw << UInt64((i % 2) * 16); if i < 2 { lo |= s } else { hi |= s } }
                 gpr[rd] = UInt128(hi: hi, lo: lo)
             }
-        case 0x16: // PEXCW — exchange words within doubleword
+        case 0x16:
             if rd != 0 {
                 let w0 = gpr[rt].lo32; let w1 = UInt32(gpr[rt].lo >> 32)
                 let w2 = UInt32(gpr[rt].hi & 0xFFFF_FFFF); let w3 = UInt32(gpr[rt].hi >> 32)
@@ -585,7 +666,7 @@ public final class EmotionEngine {
     private func gpr32(_ i: Int) -> UInt32 { gpr[i].lo32 }
     private func setGPR(_ i: Int, value: UInt64) {
         guard i != 0 else { return }
-        gpr[i] = UInt128(hi: value >> 63 == 0 ? 0 : 0xFFFF_FFFF_FFFF_FFFF, lo: value)
+        gpr[i] = UInt128(hi: (value >> 63) == 0 ? 0 : 0xFFFF_FFFF_FFFF_FFFF, lo: value)
     }
     private func setGPR32(_ i: Int, value: Int32) {
         guard i != 0 else { return }
@@ -600,7 +681,10 @@ public final class EmotionEngine {
         inDelaySlot = true
         nextPC = UInt32(bitPattern: Int32(bitPattern: pc) &+ (offset << 2))
     }
-    private func branchIfFalse() { pc &+= 4 }
+
+    private func skipDelaySlot() {
+        nullifyDelaySlot = true
+    }
 
     // Jumps
     private func executeJ(imm26: UInt32) {
@@ -636,10 +720,16 @@ public final class EmotionEngine {
         if Int64(bitPattern: gpr64(rs)) > 0 { branchTo(offset: offset) }
     }
     private func executeBEQL(rs: Int, rt: Int, offset: Int32) {
-        if gpr64(rs) == gpr64(rt) { branchTo(offset: offset) } else { pc &+= 4 }
+        if gpr64(rs) == gpr64(rt) { branchTo(offset: offset) } else { skipDelaySlot() }
     }
     private func executeBNEL(rs: Int, rt: Int, offset: Int32) {
-        if gpr64(rs) != gpr64(rt) { branchTo(offset: offset) } else { pc &+= 4 }
+        if gpr64(rs) != gpr64(rt) { branchTo(offset: offset) } else { skipDelaySlot() }
+    }
+    private func executeBLEZL(rs: Int, offset: Int32) {
+        if Int64(bitPattern: gpr64(rs)) <= 0 { branchTo(offset: offset) } else { skipDelaySlot() }
+    }
+    private func executeBGTZL(rs: Int, offset: Int32) {
+        if Int64(bitPattern: gpr64(rs)) > 0 { branchTo(offset: offset) } else { skipDelaySlot() }
     }
     private func executeBLTZ(rs: Int, offset: Int32) {
         if Int64(bitPattern: gpr64(rs)) < 0 { branchTo(offset: offset) }
@@ -648,10 +738,10 @@ public final class EmotionEngine {
         if Int64(bitPattern: gpr64(rs)) >= 0 { branchTo(offset: offset) }
     }
     private func executeBLTZL(rs: Int, offset: Int32) {
-        if Int64(bitPattern: gpr64(rs)) < 0 { branchTo(offset: offset) } else { pc &+= 4 }
+        if Int64(bitPattern: gpr64(rs)) < 0 { branchTo(offset: offset) } else { skipDelaySlot() }
     }
     private func executeBGEZL(rs: Int, offset: Int32) {
-        if Int64(bitPattern: gpr64(rs)) >= 0 { branchTo(offset: offset) } else { pc &+= 4 }
+        if Int64(bitPattern: gpr64(rs)) >= 0 { branchTo(offset: offset) } else { skipDelaySlot() }
     }
     private func executeBLTZAL(rs: Int, offset: Int32) {
         setGPR(31, value: UInt64(pc &+ 4))
@@ -665,7 +755,7 @@ public final class EmotionEngine {
         let cond = cop0.fcr31_cond
         let take = tf == 1 ? cond : !cond
         if take { branchTo(offset: offset) }
-        else if nd == 1 { pc &+= 4 }
+        else if nd == 1 { skipDelaySlot() }
     }
 
     // Arithmetic immediate
@@ -677,8 +767,8 @@ public final class EmotionEngine {
     private func executeORI(rt: Int, rs: Int, imm: UInt16) { setGPR(rt, value: gpr64(rs) | UInt64(imm)) }
     private func executeXORI(rt: Int, rs: Int, imm: UInt16) { setGPR(rt, value: gpr64(rs) ^ UInt64(imm)) }
     private func executeLUI(rt: Int, imm: UInt16) { setGPR32(rt, value: Int32(bitPattern: UInt32(imm) << 16)) }
+    private func executeDADDI(rt: Int, rs: Int, imm: Int32) { setGPR64(rt, value: Int64(bitPattern: gpr64(rs)) &+ Int64(imm)) }
     private func executeDADDIU(rt: Int, rs: Int, imm: Int32) { setGPR64(rt, value: Int64(bitPattern: gpr64(rs)) &+ Int64(imm)) }
-    private func executeDDIVI(rt: Int, rs: Int, imm: Int32) { executeDADDIU(rt: rt, rs: rs, imm: imm) }
 
     // ALU R-type
     private func executeADD(rd: Int, rs: Int, rt: Int) { setGPR32(rd, value: Int32(bitPattern: gpr32(rs)) &+ Int32(bitPattern: gpr32(rt))) }
@@ -748,18 +838,105 @@ public final class EmotionEngine {
     private func executeLW(rt: Int, base: Int, offset: Int32) { setGPR32(rt, value: Int32(bitPattern: bus!.read32(address: ea(base: base, offset: offset)))) }
     private func executeLWU(rt: Int, base: Int, offset: Int32) { setGPR(rt, value: UInt64(bus!.read32(address: ea(base: base, offset: offset)))) }
     private func executeLD(rt: Int, base: Int, offset: Int32) { setGPR(rt, value: bus!.read64(address: ea(base: base, offset: offset))) }
-    private func executeLQ(rt: Int, base: Int, offset: Int32) { gpr[rt] = bus!.read128(address: ea(base: base, offset: offset) & ~0xF) }
-    private func executeLWL(rt: Int, base: Int, offset: Int32) { /* Unaligned load left — simplified */ executeLW(rt: rt, base: base, offset: offset) }
-    private func executeLWR(rt: Int, base: Int, offset: Int32) { /* Unaligned load right — simplified */ }
+    private func executeLQ(rt: Int, base: Int, offset: Int32) {
+        if rt != 0 { gpr[rt] = bus!.read128(address: ea(base: base, offset: offset) & ~0xF) }
+    }
+
+    private func executeLWL(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~3
+        let word = bus!.read32(address: aligned)
+        let shift = (addr & 3) * 8
+        let mask = UInt32(0x00FF_FFFF) >> shift
+        let merged = (gpr32(rt) & mask) | (word << (24 - shift))
+        setGPR32(rt, value: Int32(bitPattern: merged))
+    }
+
+    private func executeLWR(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~3
+        let word = bus!.read32(address: aligned)
+        let shift = (addr & 3) * 8
+        let mask = shift == 0 ? 0 : (UInt32(0xFFFF_FFFF) << (32 - shift))
+        let merged = (gpr32(rt) & mask) | (word >> shift)
+        setGPR32(rt, value: Int32(bitPattern: merged))
+    }
+
+    private func executeLDL(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~7
+        let dword = bus!.read64(address: aligned)
+        let shift = UInt64((addr & 7) * 8)
+        let mask = UInt64(0x00FF_FFFF_FFFF_FFFF) >> shift
+        setGPR(rt, value: (gpr64(rt) & mask) | (dword << (56 - shift)))
+    }
+
+    private func executeLDR(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~7
+        let dword = bus!.read64(address: aligned)
+        let shift = UInt64((addr & 7) * 8)
+        let mask = shift == 0 ? 0 : (UInt64.max << (64 - shift))
+        setGPR(rt, value: (gpr64(rt) & mask) | (dword >> shift))
+    }
+
     private func executeSB(rt: Int, base: Int, offset: Int32) { bus!.write8(address: ea(base: base, offset: offset), value: UInt8(gpr32(rt) & 0xFF)) }
     private func executeSH(rt: Int, base: Int, offset: Int32) { bus!.write16(address: ea(base: base, offset: offset), value: UInt16(gpr32(rt) & 0xFFFF)) }
     private func executeSW(rt: Int, base: Int, offset: Int32) { bus!.write32(address: ea(base: base, offset: offset), value: gpr32(rt)) }
     private func executeSD(rt: Int, base: Int, offset: Int32) { bus!.write64(address: ea(base: base, offset: offset), value: gpr64(rt)) }
     private func executeSQ(rt: Int, base: Int, offset: Int32) { bus!.write128(address: ea(base: base, offset: offset) & ~0xF, value: gpr[rt]) }
 
+    private func executeSWL(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~3
+        let word = bus!.read32(address: aligned)
+        let shift = (addr & 3) * 8
+        let mask = UInt32(0xFFFF_FF00) << shift
+        bus!.write32(address: aligned, value: (word & mask) | (gpr32(rt) >> (24 - shift)))
+    }
+
+    private func executeSWR(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~3
+        let word = bus!.read32(address: aligned)
+        let shift = (addr & 3) * 8
+        let mask = shift == 0 ? 0 : (UInt32(0xFFFF_FFFF) >> (32 - shift))
+        bus!.write32(address: aligned, value: (word & mask) | (gpr32(rt) << shift))
+    }
+
+    private func executeSDL(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~7
+        let dword = bus!.read64(address: aligned)
+        let shift = UInt64((addr & 7) * 8)
+        let mask = UInt64(0xFFFF_FFFF_FFFF_FF00) << shift
+        bus!.write64(address: aligned, value: (dword & mask) | (gpr64(rt) >> (56 - shift)))
+    }
+
+    private func executeSDR(rt: Int, base: Int, offset: Int32) {
+        let addr = ea(base: base, offset: offset)
+        let aligned = addr & ~7
+        let dword = bus!.read64(address: aligned)
+        let shift = UInt64((addr & 7) * 8)
+        let mask = shift == 0 ? 0 : (UInt64.max >> (64 - shift))
+        bus!.write64(address: aligned, value: (dword & mask) | (gpr64(rt) << shift))
+    }
+
     // COP0
-    private func executeMFC0(rt: Int, rd: Int) { setGPR32(rt, value: Int32(bitPattern: cop0.read(register: rd))) }
-    private func executeMTC0(rt: Int, rd: Int) { cop0.write(register: rd, value: gpr32(rt)) }
+    private func executeMFC0(rt: Int, rd: Int) {
+        if rd == 9 {
+            setGPR32(rt, value: Int32(bitPattern: cop0Count))
+            return
+        }
+        setGPR32(rt, value: Int32(bitPattern: cop0.read(register: rd)))
+    }
+    private func executeMTC0(rt: Int, rd: Int) {
+        if rd == 9 {
+            cop0Count = gpr32(rt)
+            return
+        }
+        cop0.write(register: rd, value: gpr32(rt))
+    }
     private func executeTLBWI() { cop0.tlbWriteIndexed() }
     private func executeTLBWR() { cop0.tlbWriteRandom() }
     private func executeTLBP() { cop0.tlbProbe() }
@@ -770,40 +947,42 @@ public final class EmotionEngine {
     // COP1
     private func executeMFC1(rt: Int, fs: Int) { setGPR32(rt, value: Int32(bitPattern: fpr[fs].bitPattern)) }
     private func executeMTC1(rt: Int, fs: Int) { fpr[fs] = Float(bitPattern: gpr32(rt)) }
+    private func executeLWC1(ft: Int, base: Int, offset: Int32) {
+        fpr[ft] = Float(bitPattern: bus!.read32(address: ea(base: base, offset: offset)))
+    }
+    private func executeSWC1(ft: Int, base: Int, offset: Int32) {
+        bus!.write32(address: ea(base: base, offset: offset), value: fpr[ft].bitPattern)
+    }
 
     // COP2 (VU0 macro mode)
-    // Accessed via op=0x12. RS field selects sub-operation.
-
-    weak var vu0: VectorUnit?
-
     private func decodeCOP2(rs: Int, rt: Int, rd: Int, instruction: UInt32) {
         switch rs {
-        case 0x01: // QMFC2 — move 128-bit VF to EE GPR
+        case 0x01:
             guard let vu = vu0 else { return }
             let vfIdx = rd & 0x1F
             let (hi, lo) = vu.readVFasGPR(vfIdx)
             if rt != 0 { gpr[rt] = UInt128(hi: hi, lo: lo) }
-        case 0x02: // CFC2 — move control register (VI) to EE GPR
+        case 0x02:
             guard let vu = vu0 else { return }
             let viIdx = rd & 0x1F
             setGPR32(rt, value: Int32(bitPattern: vu.readVIasGPR(viIdx)))
-        case 0x05: // QMTC2 — move EE GPR to 128-bit VF
+        case 0x05:
             guard let vu = vu0 else { return }
             let vfIdx = rd & 0x1F
             vu.writeVFfromGPR(vfIdx, hi: gpr[rt].hi, lo: gpr[rt].lo64)
-        case 0x06: // CTC2 — move EE GPR to VI control register
+        case 0x06:
             guard let vu = vu0 else { return }
             let viIdx = rd & 0x1F
             vu.writeVIfromGPR(viIdx, value: gpr32(rt))
-        case 0x08: // BC2 — branch on COP2 condition
+        case 0x08:
             let nd = (instruction >> 17) & 1
             let tf = (instruction >> 16) & 1
             let offset = Int32(Int16(bitPattern: UInt16(instruction & 0xFFFF)))
             let cond = vu0?.statusFlag != 0
             let take = tf == 1 ? cond : !cond
             if take { branchTo(offset: offset) }
-            else if nd == 1 { pc &+= 4 }
-        case 0x10...0x1F: // COP2 special — VU0 macro-mode instruction
+            else if nd == 1 { skipDelaySlot() }
+        case 0x10...0x1F:
             vu0?.executeMacro(instruction: instruction & 0x07FF_FFFF)
         default:
             break
@@ -812,17 +991,19 @@ public final class EmotionEngine {
 
     // System
     private func executeSYSCALL() {
-        cop0.epc = pc &- 4   // EPC points to the SYSCALL instruction
+        cop0.epc = pc &- 4
         let vector = cop0.triggerException(type: .syscall)
         inDelaySlot = false
+        nullifyDelaySlot = false
         pc = vector
     }
-    private func executeSYNC() { /* memory barrier — no-op in interpreter */ }
+    private func executeSYNC() {}
 
     private func handleUnknownInstruction(op: UInt32, extra: UInt32 = 0) {
         cop0.epc = pc &- 4
         let vector = cop0.triggerException(type: .reservedInstruction)
         inDelaySlot = false
+        nullifyDelaySlot = false
         pc = vector
     }
 }
