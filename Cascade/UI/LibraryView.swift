@@ -1,3 +1,4 @@
+import PhotosUI
 import SwiftUI
 import UIKit
 import UniformTypeIdentifiers
@@ -90,6 +91,7 @@ struct LibraryView: View {
     @Environment(\.scenePhase) private var scenePhase
 
     @StateObject private var documentPicker = DocumentPickerPresenter()
+    @ObservedObject private var coverCache = GameCoverCache.shared
 
     @State private var searchText: String = ""
     @State private var selectedFilter: LibraryFilter = .all
@@ -100,6 +102,11 @@ struct LibraryView: View {
     @State private var newCollectionColorIndex: Int = 0
     @State private var gameToRename: GameEntry?
     @State private var renameText: String = ""
+
+    // Custom thumbnail picker state
+    @State private var gameForThumbnailPicker: GameEntry?
+    @State private var showThumbnailPicker: Bool = false
+    @State private var selectedPhotoItem: PhotosPickerItem?
 
     enum LibraryFilter: String, CaseIterable, Identifiable {
         case all = "All Games"
@@ -183,6 +190,15 @@ struct LibraryView: View {
                                             gameToRename = game
                                             renameText = game.title
                                         },
+                                        onPickCustomThumbnail: {
+                                            gameForThumbnailPicker = game
+                                            selectedPhotoItem = nil
+                                            showThumbnailPicker = true
+                                        },
+                                        onResetCustomThumbnail: {
+                                            coverCache.removeCustomCover(for: game)
+                                            coverCache.fetchCoverIfNeeded(for: game)
+                                        },
                                         onAssignCollection: { collection in
                                             libraryManager.assignGame(game, to: collection)
                                         },
@@ -217,6 +233,22 @@ struct LibraryView: View {
             .onChange(of: scenePhase) { newPhase in
                 if newPhase == .active {
                     syncFoldersAndBIOS(forceReloadBIOS: !emulatorState.biosLoaded)
+                }
+            }
+            .photosPicker(
+                isPresented: $showThumbnailPicker,
+                selection: $selectedPhotoItem,
+                matching: .images
+            )
+            .onChange(of: selectedPhotoItem) { newItem in
+                guard let newItem, let targetGame = gameForThumbnailPicker else { return }
+                Task {
+                    if let data = try? await newItem.loadTransferable(type: Data.self),
+                       let image = UIImage(data: data) {
+                        coverCache.setCustomCover(image, for: targetGame)
+                    }
+                    selectedPhotoItem = nil
+                    gameForThumbnailPicker = nil
                 }
             }
             .toolbar {
@@ -373,14 +405,17 @@ struct LibraryView: View {
             handleLaunch(game)
         } label: {
             HStack(spacing: 12) {
-                ZStack {
-                    RoundedRectangle(cornerRadius: 12, style: .continuous)
-                        .fill(Color(red: 0.22, green: 0.52, blue: 0.96).opacity(0.25))
-                        .frame(width: 46, height: 46)
-                    Image(systemName: "play.fill")
-                        .font(.headline)
-                        .foregroundStyle(Color(red: 0.36, green: 0.68, blue: 1.0))
-                }
+                GameThumbnailView(
+                    game: game,
+                    accentColor: Color(red: 0.22, green: 0.52, blue: 0.96),
+                    compact: true
+                )
+                .frame(width: 44, height: 60)
+                .clipShape(RoundedRectangle(cornerRadius: 10, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 10, style: .continuous)
+                        .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                )
 
                 VStack(alignment: .leading, spacing: 3) {
                     Text("CONTINUE PLAYING")
@@ -397,9 +432,9 @@ struct LibraryView: View {
 
                 Spacer()
 
-                Image(systemName: "chevron.right")
-                    .font(.caption.weight(.semibold))
-                    .foregroundStyle(Color.white.opacity(0.5))
+                Image(systemName: "play.circle.fill")
+                    .font(.title2)
+                    .foregroundStyle(Color(red: 0.36, green: 0.68, blue: 1.0))
             }
             .padding(12)
             .background(
@@ -693,6 +728,133 @@ struct LibraryView: View {
     }
 }
 
+// MARK: - GameThumbnailView (Box-Art Cover + Stylized PS2 Case Fallback)
+
+struct GameThumbnailView: View {
+    let game: GameEntry
+    let accentColor: Color?
+    var compact: Bool = false
+
+    @ObservedObject private var coverCache = GameCoverCache.shared
+
+    var body: some View {
+        let _ = coverCache.revision
+        Group {
+            if let cover = coverCache.coverImage(for: game) {
+                Image(uiImage: cover)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .overlay(
+                        LinearGradient(
+                            colors: [
+                                Color.black.opacity(0.25),
+                                Color.clear,
+                                Color.black.opacity(0.45)
+                            ],
+                            startPoint: .top,
+                            endPoint: .bottom
+                        )
+                    )
+            } else {
+                ps2BoxArtFallback
+            }
+        }
+        .onAppear {
+            coverCache.fetchCoverIfNeeded(for: game)
+        }
+        .onChange(of: game.discID) { _ in
+            coverCache.fetchCoverIfNeeded(for: game)
+        }
+    }
+
+    private var regionHeaderColor: Color {
+        switch game.regionBadge {
+        case "PAL":
+            return Color(red: 0.08, green: 0.45, blue: 0.85)
+        case "NTSC-J":
+            return Color(red: 0.78, green: 0.16, blue: 0.28)
+        case "NTSC-K":
+            return Color(red: 0.48, green: 0.22, blue: 0.78)
+        default:
+            return accentColor ?? Color(red: 0.12, green: 0.34, blue: 0.82)
+        }
+    }
+
+    private var artworkGradientColors: [Color] {
+        let hash = abs(game.title.hashValue ^ game.discID.hashValue)
+        let palettes: [[Color]] = [
+            [Color(red: 0.14, green: 0.28, blue: 0.62), Color(red: 0.06, green: 0.10, blue: 0.20)],
+            [Color(red: 0.36, green: 0.16, blue: 0.56), Color(red: 0.08, green: 0.09, blue: 0.18)],
+            [Color(red: 0.10, green: 0.42, blue: 0.52), Color(red: 0.05, green: 0.11, blue: 0.18)],
+            [Color(red: 0.52, green: 0.18, blue: 0.30), Color(red: 0.09, green: 0.08, blue: 0.16)],
+            [Color(red: 0.18, green: 0.44, blue: 0.34), Color(red: 0.06, green: 0.12, blue: 0.16)]
+        ]
+        return palettes[hash % palettes.count]
+    }
+
+    private var ps2BoxArtFallback: some View {
+        VStack(spacing: 0) {
+            if !compact {
+                HStack(spacing: 4) {
+                    Text("PS2")
+                        .font(.system(size: 9, weight: .black, design: .rounded))
+                        .foregroundStyle(.white)
+                    Spacer()
+                    Text(game.regionBadge)
+                        .font(.system(size: 8, weight: .bold, design: .monospaced))
+                        .foregroundStyle(.white.opacity(0.92))
+                }
+                .padding(.horizontal, 8)
+                .padding(.vertical, 4)
+                .background(regionHeaderColor)
+            }
+
+            ZStack {
+                LinearGradient(
+                    colors: artworkGradientColors,
+                    startPoint: .topLeading,
+                    endPoint: .bottomTrailing
+                )
+
+                Circle()
+                    .stroke(Color.white.opacity(0.10), lineWidth: compact ? 4 : 10)
+                    .frame(width: compact ? 34 : 84, height: compact ? 34 : 84)
+
+                Circle()
+                    .stroke(Color.white.opacity(0.16), lineWidth: 1)
+                    .frame(width: compact ? 14 : 30, height: compact ? 14 : 30)
+
+                if compact {
+                    Image(systemName: "opticaldisc.fill")
+                        .font(.system(size: 18))
+                        .foregroundStyle(.white.opacity(0.9))
+                } else {
+                    VStack(spacing: 6) {
+                        Image(systemName: "opticaldisc.fill")
+                            .font(.system(size: 28))
+                            .foregroundStyle(.white.opacity(0.9))
+
+                        Text(game.title)
+                            .font(.caption2.weight(.bold))
+                            .foregroundStyle(.white)
+                            .multilineTextAlignment(.center)
+                            .lineLimit(2)
+                            .padding(.horizontal, 8)
+
+                        Text(game.discID)
+                            .font(.system(size: 9, weight: .semibold, design: .monospaced))
+                            .foregroundStyle(.white.opacity(0.78))
+                            .padding(.horizontal, 6)
+                            .padding(.vertical, 2)
+                            .background(Color.black.opacity(0.32), in: Capsule())
+                    }
+                    .padding(.vertical, 6)
+                }
+            }
+        }
+    }
+}
+
 // MARK: - GameCardView
 
 struct GameCardView: View {
@@ -701,45 +863,39 @@ struct GameCardView: View {
     let onLaunch: () -> Void
     let onToggleFavorite: () -> Void
     let onRename: () -> Void
+    let onPickCustomThumbnail: () -> Void
+    let onResetCustomThumbnail: () -> Void
     let onAssignCollection: (GameCollection?) -> Void
     let onDelete: () -> Void
     let collections: [GameCollection]
 
+    @ObservedObject private var coverCache = GameCoverCache.shared
+
     var body: some View {
+        let _ = coverCache.revision
         VStack(alignment: .leading, spacing: 10) {
             ZStack(alignment: .topTrailing) {
-                RoundedRectangle(cornerRadius: 12, style: .continuous)
-                    .fill(
-                        LinearGradient(
-                            colors: [
-                                (collection?.accentColor ?? Color(red: 0.20, green: 0.44, blue: 0.88)).opacity(0.45),
-                                Color(red: 0.09, green: 0.12, blue: 0.20)
-                            ],
-                            startPoint: .topLeading,
-                            endPoint: .bottomTrailing
-                        )
-                    )
-                    .frame(height: 112)
-                    .overlay(
-                        VStack(spacing: 6) {
-                            Image(systemName: "opticaldisc.fill")
-                                .font(.system(size: 32))
-                                .foregroundStyle(.white.opacity(0.88))
-
-                            Text(game.discID)
-                                .font(.caption2.monospaced().weight(.semibold))
-                                .foregroundStyle(.white.opacity(0.82))
-                        }
-                    )
+                GameThumbnailView(
+                    game: game,
+                    accentColor: collection?.accentColor
+                )
+                .frame(maxWidth: .infinity)
+                .frame(height: 156)
+                .clipped()
+                .clipShape(RoundedRectangle(cornerRadius: 12, style: .continuous))
+                .overlay(
+                    RoundedRectangle(cornerRadius: 12, style: .continuous)
+                        .stroke(Color.white.opacity(0.12), lineWidth: 1)
+                )
 
                 Button(action: onToggleFavorite) {
                     Image(systemName: game.isFavorite ? "heart.fill" : "heart")
                         .font(.caption.weight(.bold))
-                        .foregroundStyle(game.isFavorite ? Color.pink : Color.white.opacity(0.8))
+                        .foregroundStyle(game.isFavorite ? Color.pink : Color.white.opacity(0.92))
                         .padding(7)
-                        .background(Color.black.opacity(0.35), in: Circle())
+                        .background(Color.black.opacity(0.48), in: Circle())
                 }
-                .padding(6)
+                .padding(7)
             }
 
             VStack(alignment: .leading, spacing: 4) {
@@ -789,6 +945,16 @@ struct GameCardView: View {
 
             Button(action: onRename) {
                 Label("Rename", systemImage: "pencil")
+            }
+
+            Button(action: onPickCustomThumbnail) {
+                Label("Set Custom Thumbnail", systemImage: "photo.badge.plus")
+            }
+
+            if coverCache.hasCustomCover(for: game) {
+                Button(action: onResetCustomThumbnail) {
+                    Label("Reset Thumbnail", systemImage: "arrow.uturn.backward")
+                }
             }
 
             if !collections.isEmpty {
