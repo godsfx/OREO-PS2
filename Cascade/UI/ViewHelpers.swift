@@ -13,7 +13,7 @@ extension Color {
 enum UserDefaultsSafeGuard {
     static let install: Void = {
         let cls = UserDefaults.self
-        let origSel = Selector(("setObject:forKey:"))
+        let origSel = NSSelectorFromString("setObject:forKey:")
         let swizSel = #selector(UserDefaults.cascade_safeSetObject(_:forKey:))
         guard let origMethod = class_getInstanceMethod(cls, origSel),
               let swizMethod = class_getInstanceMethod(cls, swizSel) else {

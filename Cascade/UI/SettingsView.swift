@@ -12,6 +12,7 @@ struct SettingsView: View {
     @AppStorage("controllerOpacity") var controllerOpacity: Double = 0.8
     @AppStorage("eeClockMultiplier") var eeClockMultiplier: Double = 1.0
     @AppStorage("executionMode")     var executionModeRaw: String = ExecutionMode.jit.rawValue
+    @AppStorage(DebugOverlayConfig.enabledKey) private var showDebugOverlay: Bool = false
 
     @ObservedObject private var crashReporter = CrashReporter.shared
     @State private var showBIOSImporter = false
@@ -328,6 +329,21 @@ struct SettingsView: View {
 
     private var diagnosticsSection: some View {
         Section {
+            Toggle(isOn: $showDebugOverlay) {
+                Label {
+                    VStack(alignment: .leading, spacing: 2) {
+                        Text("Debug Overlay HUD")
+                        Text("Show live FPS, GS output, CPU/JIT, Disc ID & RAM in-game")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+                } icon: {
+                    Image(systemName: "ladybug.fill")
+                        .foregroundStyle(Color.cascadeBlue)
+                }
+            }
+            .tint(Color.cascadeBlue)
+
             HStack {
                 Label("Crash Logs", systemImage: "exclamationmark.triangle")
                 Spacer()

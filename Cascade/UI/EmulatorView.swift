@@ -1,4 +1,6 @@
+import Darwin
 import SwiftUI
+import UIKit
 
 // MARK: - Main Emulator View (full-screen game display + on-screen controller)
 
@@ -43,6 +45,18 @@ struct EmulatorView: View {
                     Spacer()
                 }
                 .ignoresSafeArea()
+
+                // Debug Overlay HUD (top-left, toggled in Settings -> Diagnostics)
+                VStack {
+                    HStack {
+                        DebugOverlayHUD()
+                        Spacer()
+                    }
+                    Spacer()
+                }
+                .padding(.top, 44)
+                .padding(.leading, 12)
+                .ignoresSafeArea(edges: .horizontal)
 
                 // In-game menu overlay
                 if showMenu {
@@ -356,6 +370,229 @@ struct SaveStateSheet: View {
                     Button("Cancel") { isPresented = false }
                 }
             }
+        }
+    }
+}
+
+
+// MARK: - Debug Overlay Configuration
+
+enum DebugOverlayConfig {
+    static let enabledKey = "oreo.debugOverlay.enabled"
+}
+
+// MARK: - Debug Telemetry Sampler
+
+@MainActor
+final class DebugTelemetryModel: ObservableObject {
+    @Published var uiFPS: Double = 0
+    @Published var frameTimeMs: Double = 0
+    @Published var memoryMB: Double = 0
+    @Published var elapsedSeconds: Int = 0
+
+    private var startTime: CFTimeInterval = CACurrentMediaTime()
+    private var lastSampleTime: CFTimeInterval = CACurrentMediaTime()
+    private var frameCounter: Int = 0
+    private var timer: Timer?
+
+    func start() {
+        stop()
+        let now = CACurrentMediaTime()
+        startTime = now
+        lastSampleTime = now
+        frameCounter = 0
+
+        timer = Timer.scheduledTimer(withTimeInterval: 0.5, repeats: true) { [weak self] _ in
+            Task { @MainActor [weak self] in
+                self?.refreshStats()
+            }
+        }
+    }
+
+    func stop() {
+        timer?.invalidate()
+        timer = nil
+    }
+
+    func recordTick() {
+        frameCounter += 1
+    }
+
+    private func refreshStats() {
+        let now = CACurrentMediaTime()
+        let dt = now - lastSampleTime
+        if dt > 0 {
+            let currentFPS = Double(frameCounter) / dt
+            uiFPS = currentFPS
+            frameTimeMs = currentFPS > 0 ? (1000.0 / currentFPS) : 0
+        }
+        frameCounter = 0
+        lastSampleTime = now
+        elapsedSeconds = max(0, Int(now - startTime))
+        memoryMB = Self.currentMemoryFootprintMB()
+    }
+
+    private static func currentMemoryFootprintMB() -> Double {
+        var info = task_vm_info_data_t()
+        var count = mach_msg_type_number_t(MemoryLayout<task_vm_info_data_t>.size) / 4
+        let result = withUnsafeMutablePointer(to: &info) {
+            $0.withMemoryRebound(to: integer_t.self, capacity: Int(count)) {
+                task_info(mach_task_self_, task_flavor_t(TASK_VM_INFO), $0, &count)
+            }
+        }
+        guard result == KERN_SUCCESS else { return 0 }
+        return Double(info.phys_footprint) / (1024.0 * 1024.0)
+    }
+}
+
+// MARK: - Debug Overlay HUD
+
+struct DebugOverlayHUD: View {
+    @AppStorage(DebugOverlayConfig.enabledKey) private var isEnabled: Bool = false
+    @EnvironmentObject var emulatorState: EmulatorState
+    @StateObject private var telemetry = DebugTelemetryModel()
+    @State private var isCollapsed: Bool = false
+    @State private var copiedFeedback: Bool = false
+
+    var body: some View {
+        if isEnabled {
+            VStack(alignment: .leading, spacing: 6) {
+                headerBar
+
+                if !isCollapsed {
+                    Divider()
+                        .background(Color.white.opacity(0.2))
+
+                    metricsGrid
+                }
+            }
+            .padding(.horizontal, 10)
+            .padding(.vertical, 8)
+            .background(
+                RoundedRectangle(cornerRadius: 10, style: .continuous)
+                    .fill(Color.black.opacity(0.78))
+                    .overlay(
+                        RoundedRectangle(cornerRadius: 10, style: .continuous)
+                            .stroke(Color.cascadeBlue.opacity(0.55), lineWidth: 1)
+                    )
+            )
+            .onAppear { telemetry.start() }
+            .onDisappear { telemetry.stop() }
+            .overlay {
+                TimelineView(.animation(minimumInterval: 1.0 / 60.0)) { context in
+                    Color.clear
+                        .frame(width: 0, height: 0)
+                        .onChange(of: context.date) { _ in
+                            telemetry.recordTick()
+                        }
+                }
+            }
+        }
+    }
+
+    private var headerBar: some View {
+        HStack(spacing: 8) {
+            Circle()
+                .fill(emulatorState.frameImage != nil ? Color.green : Color.orange)
+                .frame(width: 7, height: 7)
+
+            Text(String(format: "EMU %.0f | UI %.0f FPS", emulatorState.fps, telemetry.uiFPS))
+                .font(.system(size: 11, weight: .bold, design: .monospaced))
+                .foregroundStyle(emulatorState.frameImage != nil ? .green : .orange)
+
+            Text("• \(formatElapsed(telemetry.elapsedSeconds))")
+                .font(.system(size: 10, weight: .medium, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.8))
+
+            Button {
+                copyDiagnosticsToClipboard()
+            } label: {
+                Image(systemName: copiedFeedback ? "checkmark.circle.fill" : "doc.on.doc")
+                    .font(.system(size: 12))
+                    .foregroundStyle(copiedFeedback ? .green : .white.opacity(0.8))
+            }
+            .buttonStyle(.plain)
+
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) {
+                    isCollapsed.toggle()
+                }
+            } label: {
+                Image(systemName: isCollapsed ? "chevron.down.circle.fill" : "chevron.up.circle.fill")
+                    .font(.system(size: 13))
+                    .foregroundStyle(Color.cascadeBlue)
+            }
+            .buttonStyle(.plain)
+        }
+    }
+
+    private var metricsGrid: some View {
+        VStack(alignment: .leading, spacing: 3) {
+            row("STATUS", String(describing: emulatorState.status))
+            row("GS OUT", gsFrameSummary)
+            row("CPU/JIT", "\(String(describing: emulatorState.executionMode)) (\(emulatorState.jitBlockCount) blk • \(Int(emulatorState.jitHitRate * 100))%)")
+            row("BIOS", emulatorState.biosLoaded ? "Loaded" : "MISSING")
+            row("DISC ID", "\(emulatorState.currentGame?.discID ?? "-") [\(emulatorState.currentGame?.regionBadge ?? "-")]")
+            row("FILE", emulatorState.currentGame?.fileName ?? "None")
+            row("RAM", String(format: "%.1f MB", telemetry.memoryMB))
+            row("RES", nativeResolutionText)
+        }
+        .allowsHitTesting(false)
+    }
+
+    private func row(_ key: String, _ value: String) -> some View {
+        HStack(alignment: .top, spacing: 6) {
+            Text(key)
+                .font(.system(size: 10, weight: .semibold, design: .monospaced))
+                .foregroundStyle(Color.cascadeBlue)
+                .frame(width: 54, alignment: .leading)
+
+            Text(value)
+                .font(.system(size: 10, weight: .regular, design: .monospaced))
+                .foregroundStyle(.white.opacity(0.92))
+                .lineLimit(1)
+                .truncationMode(.middle)
+        }
+    }
+
+    private var gsFrameSummary: String {
+        if let img = emulatorState.frameImage {
+            return "Active (\(Int(img.size.width))x\(Int(img.size.height)))"
+        }
+        return "Nil (No GS frame)"
+    }
+
+    private var nativeResolutionText: String {
+        let bounds = UIScreen.main.nativeBounds
+        return "\(Int(bounds.width))x\(Int(bounds.height))"
+    }
+
+    private func formatElapsed(_ sec: Int) -> String {
+        let m = sec / 60
+        let s = sec % 60
+        return String(format: "%02d:%02d", m, s)
+    }
+
+    private func copyDiagnosticsToClipboard() {
+        let report = [
+            "OREO-PS2 Debug Telemetry",
+            "Time: \(formatElapsed(telemetry.elapsedSeconds))",
+            "Status: \(String(describing: emulatorState.status))",
+            "GS Output: \(gsFrameSummary)",
+            "EMU FPS: \(String(format: "%.1f", emulatorState.fps)) | UI FPS: \(String(format: "%.1f", telemetry.uiFPS))",
+            "CPU/JIT: \(String(describing: emulatorState.executionMode)) (\(emulatorState.jitBlockCount) blocks, \(Int(emulatorState.jitHitRate * 100))% hit)",
+            "BIOS: \(emulatorState.biosLoaded ? "Loaded" : "MISSING")",
+            "Disc ID: \(emulatorState.currentGame?.discID ?? "-") [\(emulatorState.currentGame?.regionBadge ?? "-")]",
+            "File: \(emulatorState.currentGame?.fileName ?? "None")",
+            "RAM: \(String(format: "%.1f MB", telemetry.memoryMB))",
+            "Resolution: \(nativeResolutionText)"
+        ].joined(separator: "
+")
+        UIPasteboard.general.string = report
+        UIImpactFeedbackGenerator(style: .light).impactOccurred()
+        copiedFeedback = true
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.5) {
+            copiedFeedback = false
         }
     }
 }
