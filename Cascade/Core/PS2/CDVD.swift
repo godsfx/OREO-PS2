@@ -85,12 +85,16 @@ public final class CDVD {
         }
 
         let binURL = url.deletingLastPathComponent().appendingPathComponent(binFilename)
+        guard FileManager.default.fileExists(atPath: binURL.path) else {
+            throw EmulatorError.discLoadFailed("Referenced BIN file not found: \(binFilename)")
+        }
         isoData    = try Data(contentsOf: binURL, options: .mappedIfSafe)
         discURL    = url
         sectorSize = 2352
         dataOffset = 24   // Mode 2 Form 1: 12 sync + 3 address + 1 mode + 8 subheader
         parseISO9660()
         driveState = .idle
+        status     = 0x40
     }
 
     /// Auto-detect BIN without CUE: check if 2352-byte sectors yield a valid PVD.
@@ -117,27 +121,30 @@ public final class CDVD {
     // MARK: - ISO 9660 Parsing
 
     private func parseISO9660() {
-        let pvdOffset = 16 * sectorSize + dataOffset
+        pvd = nil
+        discID = ""
+        discRegion = .unknown
 
-        let slice: Data.SubSequence
+        let pvdOffset = 16 * sectorSize + dataOffset
+        guard pvdOffset >= 0 else { return }
+
         if let data = isoData, !data.isEmpty {
-            guard data.count > pvdOffset + 882 else { return }
-            slice = data[pvdOffset ..< pvdOffset + 2048]
+            let minNeeded = pvdOffset + 882
+            guard data.count > minNeeded else { return }
+            let endOffset = min(pvdOffset + 2048, data.count)
+            let pvdBytes = Data(data[pvdOffset..<endOffset])
+            pvd        = PrimaryVolumeDescriptor(data: pvdBytes[pvdBytes.startIndex...])
+            discID     = readDiscID()
+            discRegion = detectRegion()
         } else if let chd = chdReader {
             // CHD path: read the PVD sector on-demand
             guard let pvdData = try? chd.readBytes(at: UInt64(pvdOffset), length: 2048),
                   pvdData.count >= 882 else { return }
-            pvd        = PrimaryVolumeDescriptor(data: pvdData[pvdData.startIndex...])
+            let pvdBytes = Data(pvdData)
+            pvd        = PrimaryVolumeDescriptor(data: pvdBytes[pvdBytes.startIndex...])
             discID     = readDiscID()
             discRegion = detectRegion()
-            return
-        } else {
-            return
         }
-
-        pvd        = PrimaryVolumeDescriptor(data: slice)
-        discID     = readDiscID()
-        discRegion = detectRegion()
     }
 
     private func readDiscID() -> String {
@@ -199,27 +206,40 @@ public final class CDVD {
     }
 
     private func readSectors(lba: UInt32, size: UInt32, from data: Data) -> Data {
+        let reqSize = Int(size)
+        guard reqSize > 0 else { return Data() }
+
         if sectorSize == 2048 {
             // CHD path — delegate to the CHDReader when the raw Data is empty
             if data.isEmpty, let chd = chdReader {
-                let offset = UInt64(lba) * 2048
-                return (try? chd.readBytes(at: offset, length: Int(size))) ?? Data()
+                let offset = UInt64(lba) &* 2048
+                return (try? chd.readBytes(at: offset, length: reqSize)) ?? Data()
             }
-            // Standard ISO — direct offset
-            let offset = Int(lba) * 2048
-            let length = Int(size)
-            guard offset + length <= data.count else { return Data() }
-            return data[offset..<offset + length]
+            // Standard ISO — overflow-safe & bounds-checked slice
+            let (rawOffset, mulOverflow) = Int(lba).multipliedReportingOverflow(by: 2048)
+            guard !mulOverflow, rawOffset >= 0, rawOffset <= data.count else { return Data() }
+            let maxAvailable = data.count - rawOffset
+            guard maxAvailable > 0 else { return Data() }
+            let copyLen = min(reqSize, maxAvailable)
+            let (endOffset, addOverflow) = rawOffset.addingReportingOverflow(copyLen)
+            guard !addOverflow, endOffset <= data.count else { return Data() }
+            return Data(data[rawOffset..<endOffset])
         } else {
-            // Raw BIN — skip sector header for each 2352-byte sector
-            let sectorCount = (Int(size) + 2047) / 2048
-            var result = Data(capacity: Int(size))
+            // Raw BIN — skip sector header for each 2352-byte sector safely
+            let safeSize = min(reqSize, 16 * 1024 * 1024)
+            let sectorCount = (safeSize + 2047) / 2048
+            var result = Data()
+            result.reserveCapacity(safeSize)
             for i in 0..<sectorCount {
-                let sectorStart = (Int(lba) + i) * sectorSize + dataOffset
-                let bytesLeft   = Int(size) - i * 2048
-                let copyLen     = min(2048, bytesLeft)
-                guard sectorStart + copyLen <= data.count else { break }
-                result.append(contentsOf: data[sectorStart..<sectorStart + copyLen])
+                let lbaSum = Int(lba) &+ i
+                let (secMul, mOvf) = lbaSum.multipliedReportingOverflow(by: sectorSize)
+                if mOvf { break }
+                let (sectorStart, aOvf) = secMul.addingReportingOverflow(dataOffset)
+                if aOvf || sectorStart < 0 || sectorStart >= data.count { break }
+                let bytesLeft = safeSize - i * 2048
+                let copyLen = min(2048, bytesLeft, data.count - sectorStart)
+                guard copyLen > 0 else { break }
+                result.append(contentsOf: data[sectorStart..<(sectorStart + copyLen)])
             }
             return result
         }

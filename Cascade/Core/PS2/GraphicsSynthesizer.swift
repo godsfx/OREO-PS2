@@ -4,6 +4,7 @@ import simd
 
 // MARK: - PS2 Graphics Synthesizer
 // The GS renders to a 4MB local VRAM (PSMCT32, PSMCT16, PSMT8, PSMT4)
+// It supports alpha blending, fog, depth testing, and texture mapping.
 
 public final class GraphicsSynthesizer {
 
@@ -15,63 +16,58 @@ public final class GraphicsSynthesizer {
     // MARK: - GS Registers
 
     struct GSRegisters {
-        var prim:     UInt64 = 0
-        var rgbaq:    UInt64 = 0
-        var uv:       UInt64 = 0
-        var xyzf:     UInt64 = 0
-        var xyz:      UInt64 = 0
-        var tex0:     [UInt64] = [0, 0]
-        var tex1:     [UInt64] = [0, 0]
-        var clamp:    [UInt64] = [0, 0]
-        var fog:      UInt64 = 0
-        var xyzf2:    UInt64 = 0
-        var xyz2:     UInt64 = 0
-        var texA:     UInt64 = 0
-        var fogCol:   UInt64 = 0
+        var prim:    UInt64 = 0
+        var rgbaq:   UInt64 = 0
+        var uv:      UInt64 = 0
+        var xyzf:    UInt64 = 0
+        var xyz:     UInt64 = 0
+        var tex0:    [UInt64] = [0, 0]
+        var tex1:    [UInt64] = [0, 0]
+        var clamp:   [UInt64] = [0, 0]
+        var fog:     UInt64 = 0
+        var xyzf2:   UInt64 = 0
+        var xyz2:    UInt64 = 0
+        var texA:    UInt64 = 0
+        var fogCol:  UInt64 = 0
         var texFlush: UInt64 = 0
-        var xyoffset: [UInt64] = [0x8000_0000_8000, 0x8000_0000_8000] // default (2048.0, 2048.0) in 12.4 fixed point
-        var scissor:  [UInt64] = [0, 0]
-        var alpha:    [UInt64] = [0, 0]
-        var dimx:     UInt64 = 0
-        var dthe:     UInt64 = 0
+        var scissor: [UInt64] = [0, 0]
+        var alpha:   [UInt64] = [0, 0]
+        var dimx:    UInt64 = 0
+        var dthe:    UInt64 = 0
         var colClamp: UInt64 = 0
-        var test:     [UInt64] = [0, 0]
-        var pabe:     UInt64 = 0
-        var fba:      [UInt64] = [0, 0]
-        var frame:    [UInt64] = [0, 0]
-        var zbuf:     [UInt64] = [0, 0]
+        var test:    [UInt64] = [0, 0]
+        var pabe:    UInt64 = 0
+        var fba:     [UInt64] = [0, 0]
+        var frame:   [UInt64] = [0, 0]
+        var zbuf:    [UInt64] = [0, 0]
         var bitbltbuf: UInt64 = 0
-        var trxPos:   UInt64 = 0
-        var trxReg:   UInt64 = 0
-        var trxDir:   UInt64 = 0
-        var hwreg:    UInt64 = 0
-        var signal:   UInt64 = 0
-        var finish:   UInt64 = 0
-        var label:    UInt64 = 0
+        var trxPos:  UInt64 = 0
+        var trxReg:  UInt64 = 0
+        var trxDir:  UInt64 = 0
+        var hwreg:   UInt64 = 0
+        var signal:  UInt64 = 0
+        var finish:  UInt64 = 0
+        var label:   UInt64 = 0
     }
 
     var regs = GSRegisters()
 
-    // Privileged registers (accessed via EE bus at 0x1200_0000 ..< 0x1200_2000)
-    var pmode:    UInt64 = 0
-    var smode1:   UInt64 = 0
-    var smode2:   UInt64 = 0
-    var srfsh:    UInt64 = 0
-    var synch1:   UInt64 = 0
-    var synch2:   UInt64 = 0
-    var syncv:    UInt64 = 0
-    var dispfb:   [UInt64] = [0, 0]
-    var display:  [UInt64] = [0, 0]
-    var extbuf:   UInt64 = 0
-    var extdata:  UInt64 = 0
+    // Privileged registers (accessed via EE bus)
+    var pmode:   UInt64 = 0
+    var smode1:  UInt64 = 0
+    var smode2:  UInt64 = 0
+    var srfsh:   UInt64 = 0
+    var synch1:  UInt64 = 0
+    var synch2:  UInt64 = 0
+    var syncv:   UInt64 = 0
+    var dispfb:  [UInt64] = [0, 0]
+    var display: [UInt64] = [0, 0]
+    var extbuf:  UInt64 = 0
+    var extdata: UInt64 = 0
     var extwrite: UInt64 = 0
-    var bgcolor:  UInt64 = 0
-    var csr:      UInt64 = 0x1BA
-    var imr:      UInt64 = 0xFF00
-
-    /// Incremented whenever VRAM pixels or BGCOLOR change so UI only copies dirty frames
-    private(set) var frameGeneration: UInt64 = 1
-    private var hasDrawnPixels: Bool = false
+    var bgcolor: UInt64 = 0
+    var csr:     UInt64 = 0x1BA
+    var imr:     UInt64 = 0xFF00
 
     // MARK: - Primitive State
     struct Vertex {
@@ -102,180 +98,69 @@ public final class GraphicsSynthesizer {
         vram = [UInt8](repeating: 0, count: vramSize)
     }
 
-    func reset() {
-        vram = [UInt8](repeating: 0, count: vramSize)
-        regs = GSRegisters()
-        pmode = 0; smode1 = 0; smode2 = 0
-        dispfb = [0, 0]; display = [0, 0]
-        bgcolor = 0
-        csr = 0x1BA
-        imr = 0xFF00
-        vertexQueue.removeAll(keepingCapacity: true)
-        trxBuffer.removeAll(keepingCapacity: true)
-        trxWordsLeft = 0
-        hasDrawnPixels = false
-        frameGeneration &+= 1
-    }
-
-    // MARK: - Privileged Register Access (from EE bus at 0x1200_0000)
+    // MARK: - Privileged Register Access (from EE bus)
 
     func readPriv(offset: UInt32) -> UInt32 {
         switch offset {
-        case 0x00:   return UInt32(pmode & 0xFFFF_FFFF)
-        case 0x04:   return UInt32(pmode >> 32)
-        case 0x20:   return UInt32(smode2 & 0xFFFF_FFFF)
-        case 0x24:   return UInt32(smode2 >> 32)
-        case 0x70:   return UInt32(dispfb[0] & 0xFFFF_FFFF)
-        case 0x74:   return UInt32(dispfb[0] >> 32)
-        case 0x80:   return UInt32(display[0] & 0xFFFF_FFFF)
-        case 0x84:   return UInt32(display[0] >> 32)
-        case 0x90:   return UInt32(dispfb[1] & 0xFFFF_FFFF)
-        case 0x94:   return UInt32(dispfb[1] >> 32)
-        case 0xA0:   return UInt32(display[1] & 0xFFFF_FFFF)
-        case 0xA4:   return UInt32(display[1] >> 32)
-        case 0xE0:   return UInt32(bgcolor & 0xFFFF_FFFF)
-        case 0x1000: return UInt32(csr & 0xFFFF_FFFF)
-        case 0x1004: return UInt32(csr >> 32)
-        case 0x1010: return UInt32(imr & 0xFFFF_FFFF)
-        case 0x1014: return UInt32(imr >> 32)
-        default:     return 0
+        case 0x00: return UInt32(csr & 0xFFFF_FFFF)
+        case 0x04: return UInt32(csr >> 32)
+        case 0x10: return UInt32(imr & 0xFFFF_FFFF)
+        default:   return 0
         }
     }
 
     func writePriv(offset: UInt32, value: UInt32) {
-        switch offset {
-        case 0x00:
-            pmode = (pmode & ~0xFFFF_FFFF) | UInt64(value)
-            frameGeneration &+= 1
-        case 0x04:
-            pmode = (pmode & 0xFFFF_FFFF) | (UInt64(value) << 32)
-        case 0x10:
-            smode1 = (smode1 & ~0xFFFF_FFFF) | UInt64(value)
-        case 0x20:
-            smode2 = (smode2 & ~0xFFFF_FFFF) | UInt64(value)
-        case 0x70:
-            dispfb[0] = (dispfb[0] & ~0xFFFF_FFFF) | UInt64(value)
-            frameGeneration &+= 1
-        case 0x74:
-            dispfb[0] = (dispfb[0] & 0xFFFF_FFFF) | (UInt64(value) << 32)
-        case 0x80:
-            display[0] = (display[0] & ~0xFFFF_FFFF) | UInt64(value)
-        case 0x84:
-            display[0] = (display[0] & 0xFFFF_FFFF) | (UInt64(value) << 32)
-            updateOutputDimensions(from: display[0], fb: dispfb[0])
-        case 0x90:
-            dispfb[1] = (dispfb[1] & ~0xFFFF_FFFF) | UInt64(value)
-            frameGeneration &+= 1
-        case 0x94:
-            dispfb[1] = (dispfb[1] & 0xFFFF_FFFF) | (UInt64(value) << 32)
-        case 0xA0:
-            display[1] = (display[1] & ~0xFFFF_FFFF) | UInt64(value)
-        case 0xA4:
-            display[1] = (display[1] & 0xFFFF_FFFF) | (UInt64(value) << 32)
-            updateOutputDimensions(from: display[1], fb: dispfb[1])
-        case 0xE0:
-            let updated = (bgcolor & ~0xFFFF_FFFF) | UInt64(value)
-            if updated != bgcolor {
-                bgcolor = updated
-                frameGeneration &+= 1
-            }
-        case 0x1000:
-            let w1cMask = UInt64(value & 0x1F)
-            csr &= ~w1cMask
-            if (value & (1 << 9)) != 0 {
-                csr = 0x1BA
-                vertexQueue.removeAll(keepingCapacity: true)
-            }
-        case 0x1004:
-            csr = (csr & 0xFFFF_FFFF) | (UInt64(value) << 32)
-        case 0x1010:
-            imr = (imr & ~0xFFFF_FFFF) | UInt64(value)
-        default:
-            break
-        }
-    }
-
-    private func updateOutputDimensions(from disp: UInt64, fb: UInt64) {
-        let fbw = Int((fb >> 9) & 0x3F) * 64
-        let magH = max(1, Int((disp >> 23) & 0xF) + 1)
-        let dwRaw = Int((disp >> 32) & 0xFFF) + 1
-        let dhRaw = Int((disp >> 44) & 0x7FF) + 1
-        let w = fbw > 0 ? fbw : (dwRaw / magH)
-        let h = dhRaw
-        if w >= 256 && w <= 1024 && h >= 200 && h <= 640 {
-            if outputWidth != w || outputHeight != h {
-                outputWidth = w
-                outputHeight = h
-                frameGeneration &+= 1
-            }
+        switch offset >> 4 {
+        case 0x0: pmode   = (pmode   & ~(UInt64(0xFFFF_FFFF) << ((offset & 4) == 0 ? 0 : 32))) | (UInt64(value) << ((offset & 4) == 0 ? 0 : 32))
+        case 0xA: csr     = UInt64(value)
+        case 0xB: imr     = UInt64(value)
+        default:  break
         }
     }
 
     // MARK: - GIF Packet Processing
 
     func processGIFPacket(data: [UInt64], qwordCount: Int, flag: Int) {
+        // flag: 0 = PACKED, 1 = REGLIST, 2 = IMAGE, 3 = DISABLE
         var offset = 0
-        let maxQwords = min(qwordCount, data.count / 2)
-        var currentQword = 0
-
-        while currentQword < maxQwords && offset + 1 < data.count {
-            let tag = data[offset]
-            let regsField = data[offset + 1]
-            offset += 2
-            currentQword += 1
-
-            let nloop = Int(tag & 0x7FFF)
-            let eop   = (tag >> 15) & 1
-            let pre   = (tag >> 46) & 1
-            let prim  = (tag >> 47) & 0x7FF
-            let flg   = Int((tag >> 58) & 3)
-            let nreg  = Int((tag >> 60) & 0xF)
+        while offset < qwordCount {
+            let tag = data[offset]; offset += 1
+            let nloop   = Int(tag & 0x7FFF)
+            let eop     = (tag >> 15) & 1
+            let pre     = (tag >> 46) & 1
+            let prim    = (tag >> 47) & 0x7FF
+            let flg     = Int((tag >> 58) & 3)
+            let nreg    = Int((tag >> 60) & 0xF)
+            let regsField = data[offset]; offset += 1
 
             if pre != 0 { regs.prim = prim }
 
             var registers: [Int] = []
-            let count = nreg == 0 ? 16 : nreg
-            registers.reserveCapacity(count)
-            for i in 0..<count {
+            for i in 0..<(nreg == 0 ? 16 : nreg) {
                 registers.append(Int((regsField >> (i * 4)) & 0xF))
             }
 
-            switch flg {
-            case 0: // PACKED
-                for _ in 0..<nloop {
+            for _ in 0..<nloop {
+                switch flg {
+                case 0: // PACKED
                     for reg in registers {
-                        guard offset + 1 < data.count else { break }
-                        let lo = data[offset]
-                        let hi = data[offset + 1]
-                        offset += 2
-                        currentQword += 1
+                        guard offset < data.count else { break }
+                        let lo = data[offset]; offset += 1
+                        let hi = offset < data.count ? data[offset] : 0; offset += 1
                         writeGSRegPacked(reg: reg, lo: lo, hi: hi)
                     }
+                case 1: // REGLIST
+                    for reg in registers {
+                        guard offset < data.count else { break }
+                        writeGSReg(reg: reg, value: data[offset]); offset += 1
+                    }
+                case 2: // IMAGE
+                    let words = min((qwordCount - offset) * 2, trxWordsLeft)
+                    // feed image transfer
+                    offset += words / 2
+                default: break
                 }
-            case 1: // REGLIST
-                let totalRegs = nloop * count
-                for i in 0..<totalRegs {
-                    guard offset < data.count else { break }
-                    let reg = registers[i % count]
-                    writeGSReg(reg: reg, value: data[offset])
-                    offset += 1
-                }
-                if totalRegs % 2 != 0 && offset < data.count {
-                    offset += 1
-                }
-                currentQword += (totalRegs + 1) / 2
-            case 2: // IMAGE
-                for _ in 0..<nloop {
-                    guard offset + 1 < data.count else { break }
-                    feedImageData(data[offset])
-                    feedImageData(data[offset + 1])
-                    offset += 2
-                    currentQword += 1
-                }
-            default:
-                break
             }
-
             if eop != 0 { break }
         }
     }
@@ -285,10 +170,10 @@ public final class GraphicsSynthesizer {
         case 0x00: // PRIM
             regs.prim = lo & 0x7FF
         case 0x01: // RGBAQ
-            let r = Float(lo & 0xFF) / 255.0
-            let g = Float((lo >> 8) & 0xFF) / 255.0
-            let b = Float((lo >> 16) & 0xFF) / 255.0
-            let a = Float((lo >> 24) & 0xFF) / 255.0
+            let r = Float(lo & 0xFF) / 255
+            let g = Float((lo >> 8) & 0xFF) / 255
+            let b = Float((lo >> 16) & 0xFF) / 255
+            let a = Float((lo >> 24) & 0xFF) / 255
             let q = Float(bitPattern: UInt32(hi & 0xFFFF_FFFF))
             currentVertex.r = r; currentVertex.g = g; currentVertex.b = b; currentVertex.a = a; currentVertex.q = q
         case 0x02: // ST
@@ -298,9 +183,16 @@ public final class GraphicsSynthesizer {
             currentVertex.u = Float((lo & 0x3FFF) >> 4)
             currentVertex.v = Float(((lo >> 16) & 0x3FFF) >> 4)
         case 0x04, 0x0C: // XYZF2 / XYZF3
-            applyVertexXYZ(lo: lo, z: Float((lo >> 32) & 0x00FF_FFFF), fog: Float((hi >> 36) & 0xFF), kick: reg == 0x04)
+            currentVertex.x = Float(lo & 0xFFFF) / 16.0
+            currentVertex.y = Float((lo >> 16) & 0xFFFF) / 16.0
+            currentVertex.z = Float((lo >> 32) & 0x00FF_FFFF)
+            currentVertex.fog = Float((hi >> 36) & 0xFF)
+            submitVertex(kick: reg == 0x04)
         case 0x05, 0x0D: // XYZ2 / XYZ3
-            applyVertexXYZ(lo: lo, z: Float((lo >> 32) & 0xFFFF_FFFF), fog: currentVertex.fog, kick: reg == 0x05)
+            currentVertex.x = Float(lo & 0xFFFF) / 16.0
+            currentVertex.y = Float((lo >> 16) & 0xFFFF) / 16.0
+            currentVertex.z = Float((lo >> 32) & 0xFFFF_FFFF)
+            submitVertex(kick: reg == 0x05)
         case 0x06: regs.tex0[0] = lo
         case 0x07: regs.tex0[1] = lo
         case 0x08: regs.clamp[0] = lo
@@ -311,55 +203,26 @@ public final class GraphicsSynthesizer {
         }
     }
 
-    private func applyVertexXYZ(lo: UInt64, z: Float, fog: Float, kick: Bool) {
-        let context = Int((regs.prim >> 9) & 1)
-        let xyo = regs.xyoffset[context]
-        let offX = Float(xyo & 0xFFFF) / 16.0
-        let offY = Float((xyo >> 32) & 0xFFFF) / 16.0
-
-        let rawX = Float(lo & 0xFFFF) / 16.0
-        let rawY = Float((lo >> 16) & 0xFFFF) / 16.0
-
-        currentVertex.x = rawX >= offX ? (rawX - offX) : rawX
-        currentVertex.y = rawY >= offY ? (rawY - offY) : rawY
-        currentVertex.z = z
-        currentVertex.fog = fog
-        submitVertex(kick: kick)
-    }
-
     func writeGSReg(reg: Int, value: UInt64) {
         switch reg {
         case 0x00: regs.prim = value
-        case 0x01:
-            regs.rgbaq = value
-            currentVertex.r = Float(value & 0xFF) / 255.0
-            currentVertex.g = Float((value >> 8) & 0xFF) / 255.0
-            currentVertex.b = Float((value >> 16) & 0xFF) / 255.0
-            currentVertex.a = Float((value >> 24) & 0xFF) / 255.0
+        case 0x01: regs.rgbaq = value
         case 0x02, 0x03: regs.tex0[reg - 0x02] = value
-        case 0x04, 0x0C:
-            applyVertexXYZ(lo: value, z: Float((value >> 32) & 0x00FF_FFFF), fog: currentVertex.fog, kick: reg == 0x04)
-        case 0x05, 0x0D:
-            applyVertexXYZ(lo: value, z: Float((value >> 32) & 0xFFFF_FFFF), fog: currentVertex.fog, kick: reg == 0x05)
         case 0x06: regs.tex0[0] = value
         case 0x07: regs.tex0[1] = value
-        case 0x18: regs.xyoffset[0] = value
-        case 0x19: regs.xyoffset[1] = value
+        case 0x18: regs.alpha[0] = value
+        case 0x19: regs.alpha[1] = value
         case 0x40: regs.scissor[0] = value
         case 0x41: regs.scissor[1] = value
-        case 0x42: regs.alpha[0] = value
-        case 0x43: regs.alpha[1] = value
         case 0x4C: regs.frame[0] = value
         case 0x4D: regs.frame[1] = value
         case 0x4E: regs.zbuf[0] = value
         case 0x4F: regs.zbuf[1] = value
-        case 0x50: regs.bitbltbuf = value
+        case 0x50: regs.bitbltbuf = value; startTransfer(value)
         case 0x51: regs.trxPos = value
         case 0x52: regs.trxReg = value
-        case 0x53: regs.trxDir = value; startTransfer(value)
+        case 0x53: regs.trxDir = value
         case 0x54: feedImageData(value)
-        case 0x60: regs.signal = value; csr |= 1
-        case 0x61: regs.finish = value; csr |= 2
         default: break
         }
     }
@@ -368,11 +231,7 @@ public final class GraphicsSynthesizer {
 
     private func submitVertex(kick: Bool) {
         vertexQueue.append(currentVertex)
-        if kick {
-            rasterize()
-            hasDrawnPixels = true
-            frameGeneration &+= 1
-        }
+        if kick { rasterize() }
     }
 
     private func rasterize() {
@@ -392,7 +251,8 @@ public final class GraphicsSynthesizer {
     private func drawPoint() {
         guard !vertexQueue.isEmpty else { return }
         let v = vertexQueue.removeLast()
-        plotPixel(x: Int(v.x), y: Int(v.y), r: v.r, g: v.g, b: v.b, a: v.a)
+        let x = Int(v.x); let y = Int(v.y)
+        plotPixel(x: x, y: y, r: v.r, g: v.g, b: v.b, a: v.a)
     }
 
     private func drawLine() {
@@ -416,7 +276,7 @@ public final class GraphicsSynthesizer {
     private func drawTriangle() {
         guard vertexQueue.count >= 3 else { return }
         let v0 = vertexQueue[0]; let v1 = vertexQueue[1]; let v2 = vertexQueue[2]
-        vertexQueue.removeAll(keepingCapacity: true)
+        vertexQueue.removeAll()
         fillTriangle(v0: v0, v1: v1, v2: v2)
     }
 
@@ -439,15 +299,12 @@ public final class GraphicsSynthesizer {
     private func drawSprite() {
         guard vertexQueue.count >= 2 else { return }
         let v0 = vertexQueue[0]; let v1 = vertexQueue[1]
-        vertexQueue.removeAll(keepingCapacity: true)
-        let x0 = max(0, Int(min(v0.x, v1.x)))
-        let y0 = max(0, Int(min(v0.y, v1.y)))
-        let x1 = min(outputWidth, Int(max(v0.x, v1.x)))
-        let y1 = min(outputHeight, Int(max(v0.y, v1.y)))
-        guard x0 < x1, y0 < y1 else { return }
+        vertexQueue.removeAll()
+        let x0 = Int(min(v0.x, v1.x)); let y0 = Int(min(v0.y, v1.y))
+        let x1 = Int(max(v0.x, v1.x)); let y1 = Int(max(v0.y, v1.y))
         for y in y0..<y1 {
             for x in x0..<x1 {
-                plotPixel(x: x, y: y, r: v1.r, g: v1.g, b: v1.b, a: v1.a)
+                plotPixel(x: x, y: y, r: v0.r, g: v0.g, b: v0.b, a: v0.a)
             }
         }
     }
@@ -460,14 +317,9 @@ public final class GraphicsSynthesizer {
         if a.y > c.y { swap(&a, &c) }
         if b.y > c.y { swap(&b, &c) }
 
-        let totalH = c.y - a.y
-        if totalH == 0 { return }
+        let totalH = c.y - a.y; if totalH == 0 { return }
 
-        let minY = max(0, Int(a.y))
-        let maxY = min(outputHeight, Int(c.y))
-        guard minY < maxY else { return }
-
-        for y in minY..<maxY {
+        for y in Int(a.y)..<Int(c.y) {
             let second = Float(y) >= b.y
             let segH = second ? c.y - b.y : b.y - a.y
             guard segH > 0 else { continue }
@@ -481,11 +333,7 @@ public final class GraphicsSynthesizer {
             let g = a.g + (c.g - a.g) * alpha
             let ba = a.b + (c.b - a.b) * alpha
             let al = a.a + (c.a - a.a) * alpha
-            let startX = max(0, Int(xL))
-            let endX   = min(outputWidth, Int(xR))
-            if startX < endX {
-                for x in startX..<endX { plotPixel(x: x, y: y, r: r, g: g, b: ba, a: al) }
-            }
+            for x in Int(xL)..<Int(xR) { plotPixel(x: x, y: y, r: r, g: g, b: ba, a: al) }
         }
     }
 
@@ -494,9 +342,7 @@ public final class GraphicsSynthesizer {
         let dx = abs(x1 - cx); let dy = abs(y1 - cy)
         let sx = cx < x1 ? 1 : -1; let sy = cy < y1 ? 1 : -1
         var err = dx - dy
-        var steps = 0
-        while steps < 4096 {
-            steps += 1
+        while true {
             plotPixel(x: cx, y: cy, r: r, g: g, b: b, a: a)
             if cx == x1 && cy == y1 { break }
             let e2 = 2 * err
@@ -507,15 +353,13 @@ public final class GraphicsSynthesizer {
 
     private func plotPixel(x: Int, y: Int, r: Float, g: Float, b: Float, a: Float) {
         guard x >= 0, y >= 0, x < outputWidth, y < outputHeight else { return }
-        let context = Int((regs.prim >> 9) & 1)
-        let fbBase = Int((regs.frame[context] & 0x1FF) << 11)
-        let fbw = max(outputWidth, Int(((regs.frame[context] >> 16) & 0x3F) << 6))
-        let offset = fbBase + (y * fbw + x) * 4
-        guard offset >= 0, offset + 3 < vramSize else { return }
+        let fbBase = Int((regs.frame[0] & 0x1FF) << 11)
+        let offset = fbBase + (y * outputWidth + x) * 4
+        guard offset + 3 < vramSize else { return }
         vram[offset + 0] = UInt8(clamp01(r) * 255)
         vram[offset + 1] = UInt8(clamp01(g) * 255)
         vram[offset + 2] = UInt8(clamp01(b) * 255)
-        vram[offset + 3] = 255
+        vram[offset + 3] = UInt8(clamp01(a) * 128)   // PS2 alpha is 0-128
     }
 
     private func clamp01(_ v: Float) -> Float { min(1, max(0, v)) }
@@ -523,17 +367,12 @@ public final class GraphicsSynthesizer {
     // MARK: - Image Transfer
 
     private func startTransfer(_ regVal: UInt64) {
-        let dir = regVal & 0x3
-        guard dir == 0 else { return } // Host -> Local
-        let dw = Int((regs.trxReg >> 0)  & 0xFFF)
-        let dh = Int((regs.trxReg >> 32) & 0xFFF)
-        guard dw > 0, dh > 0 else { return }
+        let dw = Int((regs.trxReg >> 0)  & 0xFFF) + 1
+        let dh = Int((regs.trxReg >> 32) & 0xFFF) + 1
         trxDestX = Int(regs.trxPos & 0x7FF)
         trxDestY = Int((regs.trxPos >> 16) & 0x7FF)
-        let dpsm = Int((regs.bitbltbuf >> 56) & 0x3F)
-        let bytesPerPixel = (dpsm == 0x02 || dpsm == 0x0A) ? 2 : 4
-        trxWordsLeft = max(1, (dw * dh * bytesPerPixel + 7) / 8)
-        trxBuffer.removeAll(keepingCapacity: true)
+        trxWordsLeft = dw * dh
+        trxBuffer.removeAll()
     }
 
     private func feedImageData(_ value: UInt64) {
@@ -544,93 +383,38 @@ public final class GraphicsSynthesizer {
     }
 
     private func flushImageTransfer() {
-        let dstBase = Int(((regs.bitbltbuf >> 32) & 0x3FFF) << 8)
-        let dstW    = max(1, Int(((regs.bitbltbuf >> 48) & 0x3F) << 6))
-        let dpsm    = Int((regs.bitbltbuf >> 56) & 0x3F)
-        let dw      = max(1, Int(regs.trxReg & 0xFFF))
+        let dstBase = Int(((regs.bitbltbuf >> 32) & 0x3FFF) << 6)
+        let dstW    = Int(((regs.bitbltbuf >> 48) & 0x3F) << 6)
+        let dstFmt  = Int((regs.bitbltbuf >> 56) & 0x3F)
+        _ = dstFmt
         let x0 = trxDestX; let y0 = trxDestY
-
-        if dpsm == 0x02 || dpsm == 0x0A {
-            // PSMCT16 / PSMCT16S (16-bit RGB5A1)
-            var i = 0
-            while i + 1 < trxBuffer.count {
-                let pixIdx = i / 2
-                let px = x0 + (pixIdx % dw)
-                let py = y0 + (pixIdx / dw)
-                let off = dstBase + (py * dstW + px) * 4
-                if off >= 0 && off + 3 < vramSize {
-                    let c16 = UInt16(trxBuffer[i]) | (UInt16(trxBuffer[i + 1]) << 8)
-                    vram[off + 0] = UInt8((c16 & 0x1F) << 3)
-                    vram[off + 1] = UInt8(((c16 >> 5) & 0x1F) << 3)
-                    vram[off + 2] = UInt8(((c16 >> 10) & 0x1F) << 3)
-                    vram[off + 3] = 255
-                }
-                i += 2
+        var i = 0
+        while i + 3 < trxBuffer.count {
+            let pixIdx = i / 4
+            let px = x0 + (pixIdx % max(1, dstW))
+            let py = y0 + (pixIdx / max(1, dstW))
+            let off = dstBase + (py * outputWidth + px) * 4
+            if off + 3 < vramSize {
+                vram[off]   = trxBuffer[i]
+                vram[off+1] = trxBuffer[i+1]
+                vram[off+2] = trxBuffer[i+2]
+                vram[off+3] = trxBuffer[i+3]
             }
-        } else {
-            // PSMCT32 (32-bit RGBA8)
-            var i = 0
-            while i + 3 < trxBuffer.count {
-                let pixIdx = i / 4
-                let px = x0 + (pixIdx % dw)
-                let py = y0 + (pixIdx / dw)
-                let off = dstBase + (py * dstW + px) * 4
-                if off >= 0 && off + 3 < vramSize {
-                    vram[off + 0] = trxBuffer[i]
-                    vram[off + 1] = trxBuffer[i + 1]
-                    vram[off + 2] = trxBuffer[i + 2]
-                    vram[off + 3] = 255
-                }
-                i += 4
-            }
+            i += 4
         }
-
-        hasDrawnPixels = true
-        frameGeneration &+= 1
-        trxBuffer.removeAll(keepingCapacity: true)
+        trxBuffer.removeAll()
     }
 
     // MARK: - Frame Output
 
     func getFrameBuffer() -> Data {
-        let activeCircuit = (pmode & 0x2) != 0 ? 1 : 0
-        let dispBase = Int((dispfb[activeCircuit] & 0x1FF) << 11)
-        let drawBase = Int((regs.frame[0] & 0x1FF) << 11)
-        let fbBase   = dispBase > 0 ? dispBase : drawBase
-        let fbw      = max(outputWidth, Int(((dispfb[activeCircuit] >> 9) & 0x3F) << 6))
-        let size     = outputWidth * outputHeight * 4
-
-        if !hasDrawnPixels {
-            var out = [UInt8](repeating: 0, count: size)
-            let bgR = UInt8(bgcolor & 0xFF)
-            let bgG = UInt8((bgcolor >> 8) & 0xFF)
-            let bgB = UInt8((bgcolor >> 16) & 0xFF)
-            var i = 0
-            while i + 3 < size {
-                out[i]     = bgR
-                out[i + 1] = bgG
-                out[i + 2] = bgB
-                out[i + 3] = 255
-                i += 4
-            }
-            return Data(out)
-        }
-
-        if fbw == outputWidth {
-            let safeBase = min(fbBase, max(0, vramSize - size))
-            let end      = min(safeBase + size, vramSize)
-            return Data(vram[safeBase..<end])
-        }
-
-        var out = [UInt8](repeating: 0, count: size)
-        let rowBytes = outputWidth * 4
-        let strideBytes = fbw * 4
-        for y in 0..<outputHeight {
-            let srcOff = fbBase + y * strideBytes
-            let dstOff = y * rowBytes
-            guard srcOff >= 0, srcOff + rowBytes <= vramSize else { break }
-            out.replaceSubrange(dstOff..<(dstOff + rowBytes), with: vram[srcOff..<(srcOff + rowBytes)])
-        }
-        return Data(out)
+        let expectedSize = max(1, outputWidth * outputHeight * 4)
+        var out = Data(count: expectedSize)
+        let fbBase = Int((regs.frame[0] & 0x1FF) << 11)
+        guard fbBase >= 0, fbBase < vramSize else { return out }
+        let copyLen = min(expectedSize, vramSize - fbBase)
+        guard copyLen > 0 else { return out }
+        out.replaceSubrange(0..<copyLen, with: vram[fbBase..<(fbBase + copyLen)])
+        return out
     }
 }
