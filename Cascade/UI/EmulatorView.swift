@@ -586,8 +586,7 @@ struct DebugOverlayHUD: View {
             "File: \(emulatorState.currentGame?.fileName ?? "None")",
             "RAM: \(String(format: "%.1f MB", telemetry.memoryMB))",
             "Resolution: \(nativeResolutionText)"
-        ].joined(separator: "
-")
+        ].joined(separator: "\n")
         UIPasteboard.general.string = report
         UIImpactFeedbackGenerator(style: .light).impactOccurred()
         copiedFeedback = true
