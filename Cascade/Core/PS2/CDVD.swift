@@ -1,8 +1,8 @@
 import Foundation
 
 // MARK: - CDVD Drive Controller
-// Handles streaming ISO 9660 disc reading, BIN/CUE parsing, PS2 executable loading,
-// and NTSC/PAL region detection without loading multi-GB images into RAM.
+// Handles ISO 9660 disc reading, BIN/CUE parsing, PS2 executable loading,
+// and NTSC/PAL region detection.
 
 public final class CDVD {
 
@@ -14,7 +14,6 @@ public final class CDVD {
     var discURL:   URL?
     var isoData:   Data?
     var chdReader: CHDReader?
-    private var discHandle: FileHandle?
 
     // Sector geometry — ISO: 2048 bytes/sector, raw BIN: 2352 bytes/sector
     private var sectorSize: Int   = 2048
@@ -37,49 +36,13 @@ public final class CDVD {
     var resultLen: Int = 0
     var seekTarget: UInt32 = 0
 
-    deinit {
-        _ = try? discHandle?.close()
-    }
-
-    private func openStream(_ url: URL) throws {
-        _ = try? discHandle?.close()
-        discHandle = nil
-        chdReader  = nil
-        isoData    = Data() // non-nil sentinel for legacy nil checks
-        discHandle = try FileHandle(forReadingFrom: url)
-    }
-
-    private func readDiscBytes(at offset: UInt64, length: Int) -> Data? {
-        guard length > 0 else { return nil }
-        let capped = min(length, 16 * 1024 * 1024)
-        if let chd = chdReader {
-            return try? chd.readBytes(at: offset, length: capped)
-        }
-        if let handle = discHandle {
-            do {
-                try handle.seek(toOffset: offset)
-                return try handle.read(upToCount: capped)
-            } catch {
-                return nil
-            }
-        }
-        if let data = isoData, !data.isEmpty {
-            let start = Int(offset)
-            guard start >= 0, start + capped <= data.count else { return nil }
-            return data[start..<(start + capped)]
-        }
-        return nil
-    }
-
     // MARK: - Disc Loading
 
-    /// Load a CHD v5 disc image with uncached memory mapping so iOS Jetsam can evict clean pages.
+    /// Load a CHD v5 disc image. The CHDReader handles on-the-fly decompression.
     func loadCHD(url: URL) throws {
-        _ = try? discHandle?.close()
-        discHandle = nil
-        let data   = try Data(contentsOf: url, options: [.mappedIfSafe, .uncached])
+        let data   = try Data(contentsOf: url, options: .mappedIfSafe)
         chdReader  = try CHDReader(data: data)
-        isoData    = Data()
+        isoData    = Data()   // empty sentinel so nil-checks pass; reads go via chdReader
         discURL    = url
         sectorSize = 2048
         dataOffset = 0
@@ -88,7 +51,7 @@ public final class CDVD {
     }
 
     func loadISO(url: URL) throws {
-        try openStream(url)
+        isoData    = try Data(contentsOf: url, options: .mappedIfSafe)
         discURL    = url
         sectorSize = 2048
         dataOffset = 0
@@ -96,7 +59,8 @@ public final class CDVD {
         driveState = .idle
     }
 
-    /// Load a BIN/CUE disc image via FileHandle streaming.
+    /// Load a BIN/CUE disc image. Parses the CUE sheet to locate the BIN
+    /// track and configures raw 2352-byte sector reading.
     func loadCUE(url: URL) throws {
         let cueText = (try? String(contentsOf: url, encoding: .utf8))
             ?? (try? String(contentsOf: url, encoding: .ascii))
@@ -106,33 +70,43 @@ public final class CDVD {
         for line in cueText.components(separatedBy: .newlines) {
             let trimmed = line.trimmingCharacters(in: .whitespaces)
             if trimmed.uppercased().hasPrefix("FILE") {
+                // FILE "filename.bin" BINARY
                 let parts = trimmed.components(separatedBy: "\"")
-                if parts.count >= 2 { binFilename = parts[1]; break }
+                if parts.count >= 2 {
+                    let normalized = parts[1].replacingOccurrences(of: "\\", with: "/")
+                    binFilename = URL(fileURLWithPath: normalized).lastPathComponent
+                    break
+                }
             }
         }
 
-        guard let binFilename else {
+        guard let binFilename, !binFilename.isEmpty else {
             throw EmulatorError.discLoadFailed("No BIN file referenced in CUE sheet")
         }
 
         let binURL = url.deletingLastPathComponent().appendingPathComponent(binFilename)
-        try openStream(binURL)
+        isoData    = try Data(contentsOf: binURL, options: .mappedIfSafe)
         discURL    = url
         sectorSize = 2352
-        dataOffset = 24
+        dataOffset = 24   // Mode 2 Form 1: 12 sync + 3 address + 1 mode + 8 subheader
         parseISO9660()
         driveState = .idle
     }
 
-    /// Auto-detect BIN without CUE via FileHandle probe.
+    /// Auto-detect BIN without CUE: check if 2352-byte sectors yield a valid PVD.
     func loadBIN(url: URL) throws {
-        try openStream(url)
-        discURL = url
-        let pvdOffsetRaw = UInt64(16 * 2352 + 24)
-        if let probe = readDiscBytes(at: pvdOffsetRaw, length: 1), probe.first == 0x01 {
+        let data = try Data(contentsOf: url, options: .mappedIfSafe)
+        // Try raw 2352-byte sectors first (most PS2 BIN dumps)
+        let pvdOffsetRaw = 16 * 2352 + 24
+        if data.count > pvdOffsetRaw + 2048,
+           data[pvdOffsetRaw] == 0x01 {
+            isoData    = data
+            discURL    = url
             sectorSize = 2352
             dataOffset = 24
         } else {
+            isoData    = data
+            discURL    = url
             sectorSize = 2048
             dataOffset = 0
         }
@@ -143,24 +117,39 @@ public final class CDVD {
     // MARK: - ISO 9660 Parsing
 
     private func parseISO9660() {
-        let pvdOffset = UInt64(16 * sectorSize + dataOffset)
-        guard let pvdData = readDiscBytes(at: pvdOffset, length: 2048),
-              pvdData.count >= 882 else { return }
+        let pvdOffset = 16 * sectorSize + dataOffset
 
-        pvd        = PrimaryVolumeDescriptor(data: pvdData[pvdData.startIndex...])
+        let slice: Data.SubSequence
+        if let data = isoData, !data.isEmpty {
+            guard data.count > pvdOffset + 882 else { return }
+            slice = data[pvdOffset ..< pvdOffset + 2048]
+        } else if let chd = chdReader {
+            // CHD path: read the PVD sector on-demand
+            guard let pvdData = try? chd.readBytes(at: UInt64(pvdOffset), length: 2048),
+                  pvdData.count >= 882 else { return }
+            pvd        = PrimaryVolumeDescriptor(data: pvdData[pvdData.startIndex...])
+            discID     = readDiscID()
+            discRegion = detectRegion()
+            return
+        } else {
+            return
+        }
+
+        pvd        = PrimaryVolumeDescriptor(data: slice)
         discID     = readDiscID()
         discRegion = detectRegion()
     }
 
     private func readDiscID() -> String {
-        if let cnfData = readFile(path: "SYSTEM.CNF") {
+        // For CHD, isoData is an empty Data() sentinel — readFile handles the routing.
+        guard let data = isoData else { return "" }
+        if let cnfData = readFile(path: "SYSTEM.CNF", data: data) {
             let text = String(data: cnfData, encoding: .ascii) ?? ""
-            for line in text.components(separatedBy: .newlines) {
-                if line.uppercased().hasPrefix("BOOT2") {
+            for line in text.components(separatedBy: "\n") {
+                if line.hasPrefix("BOOT2") {
                     let parts = line.components(separatedBy: "\\")
                     if let last = parts.last {
-                        let cleaned = last.components(separatedBy: ";").first ?? last
-                        return cleaned.trimmingCharacters(in: .whitespacesAndNewlines)
+                        return last.trimmingCharacters(in: .whitespacesAndNewlines)
                     }
                 }
             }
@@ -179,10 +168,6 @@ public final class CDVD {
     // MARK: - ISO 9660 File Reading
 
     func readFile(path: String, data: Data) -> Data? {
-        return readFile(path: path)
-    }
-
-    func readFile(path: String) -> Data? {
         guard let pvd = pvd else { return nil }
         let components = path.split(separator: "/").map(String.init)
         var dirLBA  = pvd.rootDirectoryLBA
@@ -190,7 +175,7 @@ public final class CDVD {
 
         for (idx, component) in components.enumerated() {
             let isLast  = idx == components.count - 1
-            let dirData = readSectors(lba: dirLBA, size: dirSize)
+            let dirData = readSectors(lba: dirLBA, size: dirSize, from: data)
             var offset  = 0
             while offset < dirData.count {
                 let recLen = Int(dirData[offset])
@@ -203,7 +188,7 @@ public final class CDVD {
                 if entryName.uppercased() == component.uppercased() {
                     let lba  = dirData.withUnsafeBytes { $0.load(fromByteOffset: offset + 2,  as: UInt32.self).littleEndian }
                     let size = dirData.withUnsafeBytes { $0.load(fromByteOffset: offset + 10, as: UInt32.self).littleEndian }
-                    if isLast { return readSectors(lba: lba, size: size) }
+                    if isLast { return readSectors(lba: lba, size: size, from: data) }
                     dirLBA = lba; dirSize = size
                     break
                 }
@@ -213,19 +198,28 @@ public final class CDVD {
         return nil
     }
 
-    private func readSectors(lba: UInt32, size: UInt32) -> Data {
+    private func readSectors(lba: UInt32, size: UInt32, from data: Data) -> Data {
         if sectorSize == 2048 {
-            return readDiscBytes(at: UInt64(lba) * 2048, length: Int(size)) ?? Data()
+            // CHD path — delegate to the CHDReader when the raw Data is empty
+            if data.isEmpty, let chd = chdReader {
+                let offset = UInt64(lba) * 2048
+                return (try? chd.readBytes(at: offset, length: Int(size))) ?? Data()
+            }
+            // Standard ISO — direct offset
+            let offset = Int(lba) * 2048
+            let length = Int(size)
+            guard offset + length <= data.count else { return Data() }
+            return data[offset..<offset + length]
         } else {
+            // Raw BIN — skip sector header for each 2352-byte sector
             let sectorCount = (Int(size) + 2047) / 2048
             var result = Data(capacity: Int(size))
             for i in 0..<sectorCount {
-                let sectorStart = UInt64((Int(lba) + i) * sectorSize + dataOffset)
+                let sectorStart = (Int(lba) + i) * sectorSize + dataOffset
                 let bytesLeft   = Int(size) - i * 2048
                 let copyLen     = min(2048, bytesLeft)
-                guard let chunk = readDiscBytes(at: sectorStart, length: copyLen),
-                      chunk.count == copyLen else { break }
-                result.append(chunk)
+                guard sectorStart + copyLen <= data.count else { break }
+                result.append(contentsOf: data[sectorStart..<sectorStart + copyLen])
             }
             return result
         }
@@ -237,12 +231,7 @@ public final class CDVD {
         switch offset {
         case 0: return UInt32(status)
         case 1: return UInt32(error)
-        case 2:
-            guard resultLen > 0, resultPtr < result.count else { return 0 }
-            let val = UInt32(result[resultPtr])
-            resultPtr += 1
-            if resultPtr >= resultLen { status |= 0x40 }
-            return val
+        case 2: return resultLen > 0 ? UInt32(result[resultPtr]) : 0
         case 3: return UInt32(iStat)
         case 4: return UInt32(iMask)
         default: return 0
@@ -276,7 +265,6 @@ public final class CDVD {
         default:
             result[0] = 0; resultLen = 1; resultPtr = 0
         }
-        status &= ~0x40
         iStat |= 0x01
     }
 
