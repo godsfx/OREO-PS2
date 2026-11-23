@@ -14,8 +14,9 @@ final class BootDiagLogger: @unchecked Sendable {
         queue.sync {
             closeUnlocked()
 
-            let tempDir = FileManager.default.temporaryDirectory
-                .appendingPathComponent("BootDiagLogs", isDirectory: true)
+            let docsDir = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask).first
+                ?? FileManager.default.temporaryDirectory
+            let tempDir = docsDir.appendingPathComponent("BootDiagLogs", isDirectory: true)
             try? FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
 
             let formatter = ISO8601DateFormatter()
