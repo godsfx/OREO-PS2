@@ -52,6 +52,7 @@ public final class MemoryBus {
 
     /// Notifies JIT cache when executable EE RAM is modified
     var onRAMWrite: ((UInt32, UInt32) -> Void)?
+    private var loggedUnmappedIO: Set<UInt32> = []
 
     // MARK: - Init
 
@@ -317,6 +318,10 @@ public final class MemoryBus {
         case 0xF520:            // D_ENABLER
             return dmac?.read(offset: 0xF520) ?? 0
         default:
+            let addr = 0x1000_0000 | offset
+            if loggedUnmappedIO.insert(addr).inserted {
+                BootDiagLogger.shared.logHex("EE-IO", "Unhandled READ32", addr: addr, val: 0)
+            }
             return 0
         }
     }
@@ -365,6 +370,10 @@ public final class MemoryBus {
         case 0xF590:            // D_ENABLEW
             dmac?.write(offset: 0xF590, value: value)
         default:
+            let addr = 0x1000_0000 | offset
+            if loggedUnmappedIO.insert(addr).inserted {
+                BootDiagLogger.shared.logHex("EE-IO", "Unhandled WRITE32", addr: addr, val: value)
+            }
             break
         }
     }

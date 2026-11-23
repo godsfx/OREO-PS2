@@ -34,6 +34,7 @@ public final class IOProcessor {
     var ram: [UInt8] = [UInt8](repeating: 0, count: 2 * 1024 * 1024)
 
     var cycles: UInt64 = 0
+    private var loggedUnmappedIOP: Set<UInt32> = []
 
     // MARK: - Init
 
@@ -340,7 +341,11 @@ public final class IOProcessor {
         case 0x1F80_1450: return 0 // IOP HW CFG
         case 0x1F80_1C00..<0x1F80_1E00: return spu2?.readIO(offset: phys - 0x1F80_1C00) ?? 0
         case 0x1F80_1800..<0x1F80_1810: return cdvd?.readIO(offset: phys - 0x1F80_1800) ?? 0
-        default: return 0
+        default:
+            if loggedUnmappedIOP.insert(phys).inserted {
+                BootDiagLogger.shared.logHex("IOP-IO", "Unhandled READ32", addr: phys, val: 0)
+            }
+            return 0
         }
     }
 
@@ -367,7 +372,11 @@ public final class IOProcessor {
         case 0x1F80_1078: iCtrl = value & 1
         case 0x1F80_1C00..<0x1F80_1E00: spu2?.writeIO(offset: phys - 0x1F80_1C00, value: value)
         case 0x1F80_1800..<0x1F80_1810: cdvd?.writeIO(offset: phys - 0x1F80_1800, value: value)
-        default: break
+        default:
+            if loggedUnmappedIOP.insert(phys).inserted {
+                BootDiagLogger.shared.logHex("IOP-IO", "Unhandled WRITE32", addr: phys, val: value)
+            }
+            break
         }
     }
 }

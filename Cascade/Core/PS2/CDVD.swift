@@ -124,6 +124,8 @@ public final class CDVD {
         let normalized = binFilename.replacingOccurrences(of: "\\", with: "/")
         let baseName = URL(fileURLWithPath: normalized).lastPathComponent
         let binURL = url.deletingLastPathComponent().appendingPathComponent(baseName.isEmpty ? normalized : baseName)
+        let binSize = (try? FileManager.default.attributesOfItem(atPath: binURL.path)[.size] as? UInt64) ?? 0
+        BootDiagLogger.shared.log("CDVD", "CUE parsed: cue=\(url.lastPathComponent) -> bin=\(binURL.lastPathComponent) exists=\(FileManager.default.fileExists(atPath: binURL.path)) size=\(binSize)")
         guard FileManager.default.fileExists(atPath: binURL.path) else {
             throw EmulatorError.discLoadFailed("Referenced BIN file not found: \(baseName)")
         }
@@ -156,11 +158,16 @@ public final class CDVD {
     private func parseISO9660() {
         let pvdOffset = UInt64(16 * sectorSize + dataOffset)
         guard let pvdData = readDiscBytes(at: pvdOffset, length: 2048),
-              pvdData.count >= 882 else { return }
+              pvdData.count >= 882 else {
+            BootDiagLogger.shared.log("CDVD", "ISO9660 PVD read failed at offset=\(pvdOffset) sectorSize=\(sectorSize) dataOffset=\(dataOffset)")
+            return
+        }
 
+        let sig = String(bytes: pvdData.prefix(6), encoding: .ascii) ?? "?"
         pvd        = PrimaryVolumeDescriptor(data: pvdData[pvdData.startIndex...])
         discID     = readDiscID()
         discRegion = detectRegion()
+        BootDiagLogger.shared.log("CDVD", "ISO9660 PVD OK | type=0x\(String(pvdData.first ?? 0, radix: 16)) sig=\(sig) rootLBA=\(pvd?.rootDirectoryLBA ?? 0) rootSize=\(pvd?.rootDirectorySize ?? 0) discID=\(discID) region=\(discRegion.rawValue)")
     }
 
     private func readDiscID() -> String {
@@ -270,6 +277,7 @@ public final class CDVD {
     }
 
     private func processCommand() {
+        BootDiagLogger.shared.log("CDVD-IO", "Command 0x\(String(command, radix: 16, uppercase: true))")
         switch command {
         case 0x15:
             let now = Date(); let cal = Calendar.current
