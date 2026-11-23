@@ -35,6 +35,7 @@ public final class PS2Emulator: @unchecked Sendable {
     private(set) var state: State = .off
     private var runThread: Thread?
     private var running = false
+    private var lastPresentedGSGeneration: UInt64 = .max
 
     // MARK: - Timing
 
@@ -56,13 +57,13 @@ public final class PS2Emulator: @unchecked Sendable {
     }
 
     /// Balanced per-frame EE cycle budget for Swift execution on mobile ARM64,
-    /// interleaved across 16 sub-slices per frame so DMA/Timers/VBlank stay responsive.
+    /// interleaved across 16 sub-slices per frame so DMA/Timers/VBlank/IRQs stay responsive.
     var eePerFrame: Int {
-        Int(160_000.0 * clockMultiplier)
+        Int(180_000.0 * clockMultiplier)
     }
 
     var iopPerFrame: Int {
-        Int(32_000.0 * clockMultiplier)
+        Int(36_000.0 * clockMultiplier)
     }
 
     // MARK: - BIOS
@@ -100,12 +101,18 @@ public final class PS2Emulator: @unchecked Sendable {
         bus.intc  = intc
         bus.timer = timer
         bus.iop   = iop
+        bus.vif0  = vif0
+        bus.vif1  = vif1
+
         dmac.bus  = bus
         dmac.intc = intc
         dmac.gs   = gs
         dmac.vif0 = vif0
         dmac.vif1 = vif1
+
         timer.intc = intc
+
+        iop.bus    = bus
         iop.spu2   = spu2
         iop.cdvd   = cdvd
         iop.pad    = pad
@@ -115,6 +122,12 @@ public final class PS2Emulator: @unchecked Sendable {
         vif1.gs = gs
 
         ee.vu0 = vu0
+
+        // Invalidate JIT cache whenever EE or DMA overwrites executable RAM
+        bus.onRAMWrite = { [weak self] physAddr, size in
+            guard let self, self.jitCache.blockCount > 0 else { return }
+            self.jitCache.invalidate(from: physAddr, size: size)
+        }
 
         vu1.onXGKICK = { [weak self] bytes, len in
             guard let self else { return }
@@ -138,8 +151,7 @@ public final class PS2Emulator: @unchecked Sendable {
             throw EmulatorError.biosInvalid("BIOS file is too small or corrupted")
         }
         biosLoaded = true
-        let iopBiosSize = min(data.count, iop.ram.count)
-        data.copyBytes(to: &iop.ram, count: iopBiosSize)
+        lastPresentedGSGeneration = .max
     }
 
     // MARK: - Disc Loading
@@ -153,12 +165,20 @@ public final class PS2Emulator: @unchecked Sendable {
         default:    try cdvd.loadISO(url: url)
         }
         framesPerSecond = cdvd.discRegion == .pal ? 50 : 60
+        lastPresentedGSGeneration = .max
     }
 
     // MARK: - Run / Pause / Stop
 
     func start() {
         guard state == .paused || state == .off else { return }
+        if state == .off {
+            ee.reset()
+            iop.reset()
+            gs.reset()
+            jitCache.flush()
+            lastPresentedGSGeneration = .max
+        }
         state = .running
         running = true
         runThread = Thread { [weak self] in self?.runLoop() }
@@ -177,7 +197,9 @@ public final class PS2Emulator: @unchecked Sendable {
         state = .off
         ee.reset()
         iop.reset()
+        gs.reset()
         jitCache.flush()
+        lastPresentedGSGeneration = .max
     }
 
     // MARK: - Run Loop
@@ -209,10 +231,15 @@ public final class PS2Emulator: @unchecked Sendable {
         let slices = 16
         let eeSlice = max(256, eePerFrame / slices)
         let iopSlice = max(64, iopPerFrame / slices)
-        let timerTicksPerSlice = max(1, eeSlice / 128)
+        let timerTicksPerSlice = max(1, eeSlice / 64)
 
         for _ in 0..<slices {
             if !running { return }
+
+            // Check pending EE hardware interrupts before executing slice
+            if (intc.stat & intc.mask) != 0 {
+                ee.checkAndDeliverInterrupt(intcPending: true)
+            }
 
             switch executionMode {
             case .jit:     executeSliceJIT(cycles: eeSlice)
@@ -229,8 +256,18 @@ public final class PS2Emulator: @unchecked Sendable {
         applyActiveCheatsToRAM()
         signalVBlank()
 
-        let frame = gs.getFrameBuffer()
-        onFrameReady?(frame, gs.outputWidth, gs.outputHeight)
+        if (intc.stat & intc.mask) != 0 {
+            ee.checkAndDeliverInterrupt(intcPending: true)
+        }
+
+        // Only copy and emit a new framebuffer when VRAM/BGCOLOR actually changed
+        // (or on the very first frame so UI dismisses the loading spinner).
+        let currentGen = gs.frameGeneration
+        if currentGen != lastPresentedGSGeneration {
+            lastPresentedGSGeneration = currentGen
+            let frame = gs.getFrameBuffer()
+            onFrameReady?(frame, gs.outputWidth, gs.outputHeight)
+        }
     }
 
     private func applyActiveCheatsToRAM() {
@@ -287,6 +324,7 @@ public final class PS2Emulator: @unchecked Sendable {
         gs.csr |= (1 << 3)
         intc.assertIRQ(bit: 2)
         intc.assertIRQ(bit: 3)
+        iop.assertVBlankIRQ()
     }
 
     // MARK: - Save States
