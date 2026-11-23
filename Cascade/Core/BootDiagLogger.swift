@@ -10,7 +10,7 @@ final class BootDiagLogger: @unchecked Sendable {
     private init() {}
 
     @discardableResult
-    func startSession(gameTitle: String, discURL: URL) -> URL {
+    func startSession(gameTitle: String, discURL: URL) -> URL? {
         queue.sync {
             closeUnlocked()
 
