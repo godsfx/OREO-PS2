@@ -30,6 +30,7 @@
                 B0000023 /* BackgroundKeepAlive.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000023 /* BackgroundKeepAlive.swift */; };
                 B0000024 /* CheatManager.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000024 /* CheatManager.swift */; };
                 B0000025 /* CrashReporter.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000025 /* CrashReporter.swift */; };
+                B0000030 /* BootDiagLogger.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000030 /* BootDiagLogger.swift */; };
                 B0000026 /* CHDReader.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000026 /* CHDReader.swift */; };
                 B0000027 /* ViewHelpers.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000027 /* ViewHelpers.swift */; };
                 B0000028 /* VU.swift in Sources */ = {isa = PBXBuildFile; fileRef = A0000028 /* VU.swift */; };
@@ -73,6 +74,7 @@
                 A0000023 /* BackgroundKeepAlive.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BackgroundKeepAlive.swift; sourceTree = "<group>"; };
                 A0000024 /* CheatManager.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CheatManager.swift; sourceTree = "<group>"; };
                 A0000025 /* CrashReporter.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CrashReporter.swift; sourceTree = "<group>"; };
+                A0000030 /* BootDiagLogger.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = BootDiagLogger.swift; sourceTree = "<group>"; };
                 A0000026 /* CHDReader.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = CHDReader.swift; sourceTree = "<group>"; };
                 A0000027 /* ViewHelpers.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = ViewHelpers.swift; sourceTree = "<group>"; };
                 A0000028 /* VU.swift */ = {isa = PBXFileReference; lastKnownFileType = sourcecode.swift; path = VU.swift; sourceTree = "<group>"; };
@@ -156,6 +158,7 @@
                                 A0000023 /* BackgroundKeepAlive.swift */,
                                 A0000024 /* CheatManager.swift */,
                                 A0000025 /* CrashReporter.swift */,
+                                A0000030 /* BootDiagLogger.swift */,
                                 PS2GROUP,
                                 CASCADECOREGROUP,
                         );
@@ -334,6 +337,7 @@
                                 B0000023 /* BackgroundKeepAlive.swift in Sources */,
                                 B0000024 /* CheatManager.swift in Sources */,
                                 B0000025 /* CrashReporter.swift in Sources */,
+                                B0000030 /* BootDiagLogger.swift in Sources */,
                                 B0000026 /* CHDReader.swift in Sources */,
                                 B0000027 /* ViewHelpers.swift in Sources */,
                                 B0000028 /* VU.swift in Sources */,
