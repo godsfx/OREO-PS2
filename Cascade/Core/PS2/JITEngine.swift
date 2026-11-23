@@ -32,7 +32,6 @@ public enum ExecutionMode: String, CaseIterable {
 
 // MARK: - Decoded Instruction
 
-/// A single pre-decoded EE instruction ready for fast dispatch.
 struct DecodedInstruction {
     let op:    UInt32
     let rs:    Int
@@ -59,8 +58,6 @@ struct DecodedInstruction {
 
 // MARK: - Compiled Block
 
-/// A cached block of pre-decoded instructions starting at a given PC.
-/// In JIT mode the EE fetches these instead of re-decoding each cycle.
 final class CompiledBlock {
     let startPC:      UInt32
     let instructions: [DecodedInstruction]
@@ -74,18 +71,14 @@ final class CompiledBlock {
 
 // MARK: - JIT Block Cache
 
-/// Caches compiled blocks keyed by their starting PC.
-/// Thread-safe for read-heavy workloads (single writer, concurrent readers).
 public final class JITBlockCache: @unchecked Sendable {
 
-    // Maximum number of cached blocks before eviction
-    private static let maxBlocks = 4096
+    private static let maxBlocks = 16384
 
     private var cache: [UInt32: CompiledBlock] = [:]
     private var insertionOrder: [UInt32] = []
     private let lock = NSLock()
 
-    // MARK: - Stats (for Settings display)
     private(set) var totalCompilations: Int = 0
     private(set) var cacheHits: Int = 0
     private(set) var cacheMisses: Int = 0
@@ -122,7 +115,6 @@ public final class JITBlockCache: @unchecked Sendable {
         totalCompilations += 1
     }
 
-    /// Invalidate a specific address range (e.g. after a DMA write to RAM).
     func invalidate(from start: UInt32, size: UInt32) {
         lock.lock(); defer { lock.unlock() }
         let end = start &+ size
@@ -152,17 +144,15 @@ public final class JITBlockCache: @unchecked Sendable {
 
 // MARK: - Block Compiler
 
-/// Walks memory from `startPC` and decodes instructions into a CompiledBlock.
-/// Stops at any branch/jump or after `maxInstructions`.
 enum BlockCompiler {
-    static let maxInstructions = 64
+    static let maxInstructions = 128
 
-    /// Branch/jump opcodes that terminate a block
-    private static let branchOps: Set<UInt32> = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x14, 0x15]
+    private static let branchOps: Set<UInt32> = [0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x14, 0x15, 0x16, 0x17]
     private static let branchFuncts: Set<UInt32> = [0x08, 0x09] // JR, JALR
 
     static func compile(at pc: UInt32, bus: MemoryBus) -> CompiledBlock {
         var instructions: [DecodedInstruction] = []
+        instructions.reserveCapacity(32)
         var currentPC = pc
         var inDelaySlot = false
 
@@ -175,7 +165,7 @@ enum BlockCompiler {
             if inDelaySlot { break }
 
             let isBranch = branchOps.contains(decoded.op) ||
-                           (decoded.op == 0x01) ||  // REGIMM
+                           (decoded.op == 0x01) ||
                            (decoded.op == 0x00 && branchFuncts.contains(decoded.funct))
             if isBranch { inDelaySlot = true }
         }
